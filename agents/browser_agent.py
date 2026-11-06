@@ -19,7 +19,7 @@ class BrowserAgentError(Exception):
 
 
 class PlatformBrowserAgent:
-    def __init__(self, platform_name: str, evidence_dir: Path, headless: bool = False, profile_dir: Path | None = None):
+    def __init__(self, platform_name: str, evidence_dir: Path, headless: bool = True, profile_dir: Path | None = None):
         self.platform = str(platform_name).strip().lower()
         try:
             self.config = get_platform_config(platform_name)
@@ -58,8 +58,19 @@ class PlatformBrowserAgent:
         else:
             self.browser = self.context.browser
 
-        self.context.set_default_timeout(15_000)
+        self.context.set_default_timeout(5_000)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+
+        # SPEED OPTIMIZATION: Block heavy assets (Images, CSS, Fonts, Tracking)
+        def _block_resources(route):
+            if route.request.resource_type in ["image", "media", "font"]:
+                route.abort()
+            elif any(track in route.request.url for track in ["analytics", "telemetry", "doubleclick"]):
+                route.abort()
+            else:
+                route.continue_()
+
+        self.page.route("**/*", _block_resources)
 
     def _ensure_page(self):
         if self.page is not None and not self.page.is_closed():
@@ -89,27 +100,27 @@ class PlatformBrowserAgent:
         for sel in self._as_list(selectors):
             try:
                 loc = self.page.locator(sel)
-                for i in range(min(loc.count(), 10)):
+                for i in range(min(loc.count(), 5)):
                     if loc.nth(i).is_visible():
                         return loc.nth(i)
             except Exception:
                 continue
         return None
 
-    def _wait_visible(self, selectors, timeout_ms: int = 10_000):
+    def _wait_visible(self, selectors, timeout_ms: int = 4_000):
         end = time.time() + timeout_ms / 1000
         while time.time() < end:
             self._ensure_page()
             el = self._first_visible(selectors)
             if el:
                 return el
-            self.page.wait_for_timeout(200)
+            self.page.wait_for_timeout(100)
         return None
 
-    def _settle(self, extra_ms: int = 1000):
+    def _settle(self, extra_ms: int = 200):
         self._ensure_page()
         try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=5_000)
+            self.page.wait_for_load_state("domcontentloaded", timeout=2_000)
         except PlaywrightTimeout:
             pass
         self.page.wait_for_timeout(extra_ms)
@@ -117,45 +128,18 @@ class PlatformBrowserAgent:
     def _configured_url(self, setting: str, **values) -> str:
         return resolve_platform_url(self.config, setting, self.platform_url, **values)
 
-    def _on_configured_page(self, setting: str) -> bool:
-        configured_url = self.config.get(setting)
-        if not configured_url:
-            return False
-        expected = urlsplit(self._configured_url(setting))
-        current = urlsplit(self.page.url)
-        return (
-            current.scheme == expected.scheme
-            and current.netloc.lower() == expected.netloc.lower()
-            and current.path.rstrip("/") == expected.path.rstrip("/")
-        )
-
-    def _click_follow(self, ctrl):
-        try:
-            ctrl.click()
-            self._settle(1500)
-        except Exception:
-            href = ctrl.get_attribute("href")
-            if href:
-                self.page.goto(urljoin(self.page.url, href), wait_until="domcontentloaded")
-                self._settle(1500)
-
+    # ------------------------------------------------------------ Direct Routing Logic
     def _is_logged_in(self) -> bool:
-        """Checks if active session exists in saved persistent profile."""
+        """Directly hits the Orders page to verify active session without landing on Home/Account page."""
         try:
-            if not self._on_configured_page("orders_url"):
-                orders_url = self.config.get("orders_url")
-                target_url = self._configured_url("orders_url") if orders_url else self.platform_url
-                self.page.goto(target_url, wait_until="domcontentloaded")
-                self._settle(1000)
-            if "amazon" in self.platform:
-                ind = self.page.locator("#nav-link-accountList-nav-line-1").first
-                if ind.count() and "sign in" not in ind.inner_text().lower():
-                    log.info("Session active: Already logged in to Amazon.")
-                    return True
-                return False
-            if any(marker in self.page.url.lower()
-                   for marker in self.config.get("reauth_markers", [])):
-                return False
+            target_orders_url = self._configured_url("orders_url")
+            self.page.goto(target_orders_url, wait_until="commit")
+            self._settle(300)
+            
+            # Check if redirected to sign-in page
+            for marker in self.config.get("reauth_markers", ["/signin", "/login"]):
+                if marker in self.page.url.lower():
+                    return False
             return True
         except Exception:
             return False
@@ -164,10 +148,12 @@ class PlatformBrowserAgent:
         base_url = str(target_url or self.config.get("base_url", "")).strip()
         self.platform_url = base_url
 
+        # Check session directly on Orders page
         if self._is_logged_in():
-            log.info(f"[{self.platform}] Skipping login step; saved session active.")
+            log.info(f"[{self.platform}] Active session found! Skipped Home & Account pages.")
             return
 
+        log.info(f"[{self.platform}] Session expired. Performing authentication...")
         if self.config.get("login_flow") == "otp":
             self._login_otp(base_url, username)
         else:
@@ -175,8 +161,8 @@ class PlatformBrowserAgent:
 
     def _login_password(self, base_url: str, username: str, password: str):
         c = self.config
-        self.page.goto(base_url, wait_until="domcontentloaded")
-        self._settle(1000)
+        self.page.goto(base_url, wait_until="commit")
+        self._settle(300)
 
         nav = self._first_visible(c.get("signin_nav"))
         if nav:
@@ -190,7 +176,7 @@ class PlatformBrowserAgent:
                 btn.click()
             else:
                 email.press("Enter")
-            self._settle(1000)
+            self._settle(400)
 
         pw = self._wait_visible(c.get("password_input"))
         if pw:
@@ -200,24 +186,23 @@ class PlatformBrowserAgent:
                 sub.click()
             else:
                 pw.press("Enter")
-            self._settle(2000)
+            self._settle(800)
 
     def _login_otp(self, base_url: str, username: str):
         c = self.config
         login_url = self._configured_url("login_url") if c.get("login_url") else base_url
-        self.page.goto(login_url, wait_until="domcontentloaded")
-        self._settle(1500)
+        self.page.goto(login_url, wait_until="commit")
+        self._settle(500)
 
-        email_mode = self._wait_visible(c.get("email_mode_link"), timeout_ms=3_000)
+        email_mode = self._wait_visible(c.get("email_mode_link"), timeout_ms=2_000)
         if email_mode:
             email_mode.click()
-            self.page.wait_for_timeout(400)
+            self.page.wait_for_timeout(200)
 
-        field = self._wait_visible(c.get("email_input"), timeout_ms=5_000)
+        field = self._wait_visible(c.get("email_input"), timeout_ms=3_000)
         if field:
             field.click()
-            field.fill("")
-            field.press_sequentially(username, delay=30)
+            field.fill(username)
             btn = self._first_visible(c.get("continue_btn"))
             if btn:
                 btn.click()
@@ -226,54 +211,25 @@ class PlatformBrowserAgent:
             input(">>> Press ENTER after logging in... ")
 
     def go_to_orders(self):
-        c = self.config
-        if self._on_configured_page("orders_url"):
-            log.info("[%s] Already on the Orders page; skipping navigation.", self.platform)
-            return
-        nav = self._first_visible(c.get("orders_nav"))
-        if nav:
-            try:
-                self._click_follow(nav)
-                return
-            except Exception:
-                pass
-
-        if c.get("orders_url"):
-            try:
-                self.page.goto(self._configured_url("orders_url"), wait_until="domcontentloaded")
-                self._settle(1500)
-                return
-            except Exception:
-                pass
-
-        # Universal Keyword Scanning Fallback
-        target_type = c.get("type", "generic")
-        if target_type == "ticketing":
-            keywords = UNIVERSAL_NAVIGATION_KEYWORDS["ticketing_systems"]
-        elif target_type == "ecommerce":
-            keywords = UNIVERSAL_NAVIGATION_KEYWORDS["ecommerce_orders"]
-        else:
-            keywords = UNIVERSAL_NAVIGATION_KEYWORDS["ecommerce_orders"] + UNIVERSAL_NAVIGATION_KEYWORDS["ticketing_systems"]
-
-        found_element = None
-        for kw in keywords:
-            selectors = [
-                f"a:has-text('{kw}')", f"button:has-text('{kw}')",
-                f"[role='link']:has-text('{kw}')", f"[role='button']:has-text('{kw}')"
-            ]
-            found_element = self._first_visible(selectors)
-            if found_element:
-                break
-
-        if found_element:
-            self._click_follow(found_element)
+        """Direct Jump to Orders page URL instantly."""
+        orders_url = self._configured_url("orders_url")
+        if orders_url and orders_url not in self.page.url:
+            self.page.goto(orders_url, wait_until="commit")
+            self._settle(200)
 
     def search_order(self, order_id: str):
         c = self.config
+        # Direct Jump to specific order ID page
+        if c.get("direct_details_url"):
+            direct = self._configured_url("direct_details_url", order_id=order_id)
+            self.page.goto(direct, wait_until="commit")
+            self._settle(300)
+            return
+
         if c.get("direct_order_url"):
             direct = self._configured_url("direct_order_url", order_id=order_id)
-            self.page.goto(direct, wait_until="domcontentloaded")
-            self._settle(1000)
+            self.page.goto(direct, wait_until="commit")
+            self._settle(300)
             return
 
         box = self.page.locator(", ".join(c.get("search_input", []))).first
@@ -284,10 +240,34 @@ class PlatformBrowserAgent:
                 btn.click()
             else:
                 box.press("Enter")
-            self._settle(1500)
-        elif c.get("direct_details_url"):
-            self.page.goto(self._configured_url("direct_details_url", order_id=order_id), wait_until="domcontentloaded")
-            self._settle(1000)
+            self._settle(400)
+
+    def _open_flipkart_order_details(self, order_id: str):
+        if self.platform != "flipkart" or "/order_details" in self.page.url.lower():
+            return
+
+        order_id_pattern = re.compile(
+            rf"(?:[?&])order_id={re.escape(order_id)}(?:&|$)",
+            re.I,
+        )
+        for selector in self._as_list(self.config.get("details_link")):
+            links = self.page.locator(selector)
+            for index in range(min(links.count(), 20)):
+                link = links.nth(index)
+                href = link.get_attribute("href") or ""
+                if order_id_pattern.search(href) and link.is_visible():
+                    link.click()
+                    self._settle(300)
+                    if "/order_details" not in self.page.url.lower():
+                        raise BrowserAgentError(
+                            f"Flipkart did not open order details for {order_id}."
+                        )
+                    return
+
+        raise BrowserAgentError(
+            f"Could not find Flipkart order details for {order_id}; "
+            "payment information is not available on the order summary."
+        )
 
     def _download_invoices(self, order_id: str) -> list[dict]:
         c = self.config
@@ -297,7 +277,7 @@ class PlatformBrowserAgent:
         trigger = self._first_visible(c.get("invoice_trigger"))
         if trigger:
             try:
-                with self.page.expect_download(timeout=4_000) as dl_info:
+                with self.page.expect_download(timeout=2_000) as dl_info:
                     trigger.click()
                 out = docs / f"invoice_{order_id}.pdf"
                 dl_info.value.save_as(str(out))
@@ -327,68 +307,65 @@ class PlatformBrowserAgent:
         })
 
         self.search_order(order_id)
-        d["pages"]["search_results"] = self.page.url
-
-        # Open the order-specific details link before reading dates and prices.
-        details_link = None
-        for selector in self._as_list(self.config.get("details_link")):
-            try:
-                loc = self.page.locator(selector)
-                for i in range(min(loc.count(), 20)):
-                    candidate = loc.nth(i)
-                    if not candidate.is_visible():
-                        continue
-                    href = candidate.get_attribute("href") or ""
-                    if order_id.lower() in href.lower():
-                        details_link = candidate
-                        break
-                if details_link:
-                    break
-            except Exception:
-                continue
-        if details_link:
-            href = details_link.get_attribute("href")
-            if href:
-                self.page.goto(urljoin(self.page.url, href), wait_until="domcontentloaded")
-            else:
-                self._click_follow(details_link)
-            self._settle(1500)
-
+        self._open_flipkart_order_details(order_id)
         d["pages"]["order_details"] = self.page.url
         
-        # Ensure DOM finishes rendering before text collection
         try:
-            self.page.wait_for_selector("body", timeout=5000)
-            self.page.wait_for_load_state("domcontentloaded", timeout=5000)
+            self.page.wait_for_load_state("domcontentloaded", timeout=3000)
         except Exception:
             pass
-        self._settle(1200)
+        self._settle(1000)
+
+        # FIX: Expand Payment Details section if hidden inside dynamic dropdown/accordion
+        payment_expanders = [
+            "text=/Payment Details/i", "text=/Payment Mode/i",
+            "text=/View Payment Details/i", "div:has-text('Payment Information')"
+        ]
+        expander = self._first_visible(payment_expanders)
+        if expander:
+            try:
+                expander.click()
+                self.page.wait_for_timeout(300)
+            except Exception:
+                pass
 
         body_text = self.page.locator("body").inner_text()
         d["order_details_text"] = body_text
+        
         d["timeline"] = extract_timeline_dates(body_text)
         d["product_verification"] = match_product(product_name, [body_text])
 
-        self.page.screenshot(path=str(self.evidence_dir / "screenshots" / "order_details_page.png"))
+        self.page.screenshot(
+            path=str(self.evidence_dir / "screenshots" / "order_details_page.png"),
+            type="jpeg",
+            quality=50
+        )
         (self.evidence_dir / "documents" / "dom_order_details.html").write_text(self.page.content(), encoding="utf-8")
 
         d["invoices"] = self._download_invoices(order_id)
 
         # Return / Replacement Status Navigation
-        ret_btn = self._first_visible(self.config.get("return_status_link", []))
+        return_selectors = [
+            "a:has-text('View Return/Refund Status')", "a:has-text('Return Status')",
+            "a:has-text('Refund Status')", "a:has-text('Replacement Status')",
+            "div:has-text('Return Status')", "span:has-text('Return Status')"
+        ]
+        ret_btn = self._first_visible(return_selectors)
         if ret_btn:
             try:
-                href = ret_btn.get_attribute("href")
-                if href and not href.lower().startswith("javascript"):
-                    self.page.goto(urljoin(self.page.url, href), wait_until="domcontentloaded")
-                else:
-                    ret_btn.click()
-                self._settle(1500)
+                ret_btn.click()
+                self._settle(1000)
                 d["pages"]["return_status"] = self.page.url
                 ret_text = self.page.locator("body").inner_text()
                 ret_timeline = extract_timeline_dates(ret_text)
-                d["timeline"].update({k: v for k, v in ret_timeline.items() if v})
-                self.page.screenshot(path=str(self.evidence_dir / "screenshots" / "return_status_page.png"))
+                for k, v in ret_timeline.items():
+                    if v:
+                        d["timeline"][k] = v
+                self.page.screenshot(
+                    path=str(self.evidence_dir / "screenshots" / "return_status_page.png"),
+                    type="jpeg",
+                    quality=50
+                )
             except Exception as e:
                 log.warning(f"Return status navigation failed: {e}")
 

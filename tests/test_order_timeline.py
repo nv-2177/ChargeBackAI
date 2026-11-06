@@ -15,6 +15,51 @@ class OrderTimelineTests(unittest.TestCase):
 
         self.assertEqual(timeline["order_date"], "Sep 22, 2021")
         self.assertEqual(timeline["price"], "248")
+        self.assertEqual(timeline["payment_method"], "Net Banking")
+
+    def test_payment_methods_are_extracted_only_from_payment_context(self):
+        samples = (
+            ("Payment method\nBHIM UPI", "UPI"),
+            ("Payment Details\nCredit Card ending 1234", "Card"),
+            ("Payment Mode: Cash on Delivery", "Cash on Delivery"),
+            ("Mode of Payment\nFlipkart Pay Later", "Wallet / Pay Later"),
+            ("Payments\nShipping\nCard offers and UPI offers", ""),
+        )
+        for text, expected in samples:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    extract_timeline_dates(text)["payment_method"],
+                    expected,
+                )
+
+    def test_flipkart_opens_matching_order_details_link_for_payment_data(self):
+        agent = PlatformBrowserAgent("flipkart", Path("."))
+        agent.page = MagicMock()
+        agent.page.url = (
+            "https://www.flipkart.com/account/orders?"
+            "order_id=OD222915018370162000"
+        )
+        order_link = MagicMock()
+        order_link.get_attribute.return_value = (
+            "/order_details?order_id=OD222915018370162000"
+            "&item_id=22291501837016200"
+        )
+        order_link.is_visible.return_value = True
+        order_link.click.side_effect = lambda: setattr(
+            agent.page,
+            "url",
+            "https://www.flipkart.com/order_details?order_id=OD222915018370162000",
+        )
+        links = MagicMock()
+        links.count.return_value = 1
+        links.nth.return_value = order_link
+        agent.page.locator.return_value = links
+
+        with patch.object(agent, "_settle") as settle:
+            agent._open_flipkart_order_details("OD222915018370162000")
+
+        order_link.click.assert_called_once_with()
+        settle.assert_called_once_with(300)
 
     def test_labeled_prices_work_across_platform_formats(self):
         samples = (

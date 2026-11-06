@@ -66,23 +66,25 @@ def match_product(expected: str, candidates: list[str], threshold: float = 0.55)
 def extract_timeline_dates(text: str) -> dict:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # Prefer amounts explicitly associated with the order, not product recommendations.
+    # 1. PRICE EXTRACTION
     price = ""
     amount = r"(?:₹|Rs\.?|INR|\$)?\s*([\d,]+(?:\.\d{1,2})?)"
     price_patterns = [
-        rf"(?:Grand\s+Total|Order\s+Total|Total\s+Paid|Total\s+Amount|Amount\s+Paid|Paid)\s*[:\-]?\s*{amount}",
-        rf"\bTotal\b\s*[:\-]?\s*(?:₹|Rs\.?|INR|\$)\s*([\d,]+(?:\.\d{{1,2}})?)",
+        rf"(?:Grand\s+Total|Order\s+Total|Total\s+Paid|Total\s+Amount|Amount\s+Paid|Final\s+Price|Price|Total)\s*[:\-]?\s*{amount}",
+        r"₹\s*([\d,]+(?:\.\d{1,2})?)",
     ]
     for pattern in price_patterns:
         match = re.search(pattern, text, re.I)
-        if match:
-            price = match.group(1).replace(",", "")
-            break
+        if match and match.group(1):
+            val = match.group(1).replace(",", "")
+            if float(val) > 0:
+                price = val
+                break
 
-    # 2. PINCODE EXTRACTION (Strictly inside Shipping / Delivery Address block)
+    # 2. PINCODE EXTRACTION
     pincode = ""
     addr_block = re.search(
-        r"(?:Shipping Address|Delivery Address|Ship To|Deliver To)[\s\S]{1,300}?\b([1-9][0-9]{5})\b",
+        r"(?:Shipping Address|Delivery Address|Ship To|Deliver To|Delivery Details)[\s\S]{1,350}?\b([1-9][0-9]{5})\b",
         text, re.I
     )
     if addr_block:
@@ -93,22 +95,37 @@ def extract_timeline_dates(text: str) -> dict:
             pincode = state_pin.group(1)
 
     # 3. PAYMENT METHOD EXTRACTION
-    pay_method = ""
-    payment_section = re.search(r"(?:Payment Method|Payment Information|Payment Details)[\s\S]{1,200}", text, re.I)
-    target_text = payment_section.group(0) if payment_section else text
+    payment_contexts = []
+    payment_heading = re.compile(
+        r"^(?:payment\s+(?:method|information|details|mode|summary)|mode\s+of\s+payment)"
+        r"(?:\s*:\s*(.*))?$",
+        re.I,
+    )
+    paid_by_pattern = re.compile(r"\bpaid\b.{0,60}\b(?:by|via|using)\b", re.I)
+    for i, line in enumerate(lines):
+        heading_match = payment_heading.search(line)
+        if heading_match:
+            context_lines = [heading_match.group(1) or ""]
+            context_lines.extend(lines[i + 1:min(len(lines), i + 5)])
+            payment_contexts.append(" ".join(context_lines))
+        elif paid_by_pattern.search(line):
+            payment_contexts.append(line)
 
-    if re.search(r"Pay on Delivery|Cash on Delivery|\bCOD\b", target_text, re.I):
+    payment_text = " ".join(payment_contexts)
+    if re.search(r"Pay on Delivery|Cash on Delivery|\bCOD\b|\bPOD\b", payment_text, re.I):
         pay_method = "Cash on Delivery"
-    elif re.search(r"\bUPI\b|Google Pay|PhonePe|Paytm|\bBHIM\b", target_text, re.I):
+    elif re.search(r"\bUPI\b|Google Pay|PhonePe|Paytm|\bBHIM\b|Unified Payment|VPA", payment_text, re.I):
         pay_method = "UPI"
-    elif re.search(r"Credit Card|Debit Card|Card ending|\bVisa\b|MasterCard|RuPay", target_text, re.I):
+    elif re.search(r"Credit Card|Debit Card|Card ending|\bVisa\b|MasterCard|RuPay", payment_text, re.I):
         pay_method = "Card"
-    elif re.search(r"Net Banking", target_text, re.I):
+    elif re.search(r"Net Banking|Internet Banking", payment_text, re.I):
         pay_method = "Net Banking"
-    elif re.search(r"Amazon Pay Balance|Wallet|Flipkart Pay Later", target_text, re.I):
+    elif re.search(r"Amazon Pay Balance|Wallet|Flipkart Pay Later|SuperCoins|Gift Card|E-Gift", payment_text, re.I):
         pay_method = "Wallet / Pay Later"
+    else:
+        pay_method = ""
 
-    # 4. DATES & REPLACEMENT WINDOW
+    # 4. ORDER DATE EXTRACTION (Enhanced for Flipkart timeline formats)
     _MONTH = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
     _DATE_SRC = r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+" + _MONTH + r"\.?,?(?:\s+\d{4})?|" + _MONTH + r"\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b"
     
@@ -116,23 +133,41 @@ def extract_timeline_dates(text: str) -> dict:
         for pat in patterns:
             for i, line in enumerate(lines):
                 if re.search(pat, line, re.I):
-                    context = " ".join(lines[i:min(len(lines), i+3)])
+                    context = " ".join(lines[max(0, i-1):min(len(lines), i+5)])
                     m = re.search(_DATE_SRC, context, re.I)
                     if m:
                         return m.group()
         return ""
 
+    order_date = find_date([
+        r"order\s+(?:placed|confirmed|date)",
+        r"ordered\s+on",
+        r"ordered",
+        r"placed\s+on",
+        r"order\s+details",
+    ])
+    
+    # Direct Fallback for Flipkart "Ordered on Mon, DD Month" string
+    if not order_date:
+        m = re.search(r"(?:Ordered|Placed)\s*(?:on)?\s*,?\s*([A-Za-z]{3},\s*" + _DATE_SRC + r")", text, re.I)
+        if m:
+            order_date = m.group(1)
+        else:
+            m2 = re.search(_DATE_SRC, text, re.I)
+            if m2:
+                order_date = m2.group(0)
+
     window_match = re.search(r"(?:Return|Replacement)\s+window\s+(?:closed|closes|eligible\s+until)\s+on?\s*(" + _DATE_SRC + r")", text, re.I)
 
     return {
-        "order_date": find_date([
-            r"order\s+(?:placed|confirmed|date)",
-            r"ordered\s+on",
+        "order_date": order_date,
+        "replacement_initialization": find_date([
+            r"replacement\s+(?:requested|initiated|approved|ordered)",
+            r"return\s+(?:requested|initiated|approved)"
         ]),
-        "replacement_initialization": find_date([r"replacement\s+(?:requested|initiated|approved)", r"return\s+(?:requested|initiated)"]),
         "replacement_date": find_date([
-            r"replacement\s+(?:delivered|complete(?:d)?|shipped)",
-            r"replacement\s+item\s+delivered",
+            r"replacement\s+(?:delivered|completed|shipped)",
+            r"replacement\s+item\s+delivered"
         ]),
         "replacement_window": window_match.group(1) if window_match else "",
         "price": price,
