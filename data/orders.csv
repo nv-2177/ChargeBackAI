@@ -1,0 +1,4 @@
+case id,order id,product name,platform_url,username,password,processing_status,evidence_folder,error_message,order_date,pincode,payment_method,platform,replacement_initialization,product_match,price,replacement_window,replacement_date
+CASE001,171-3670953-3026706,MILTON Comet 750 Stainless Steel Water Bottle 730 ml,https://www.amazon.in,7200370264,nevemadhu,Completed,C:\projects-1\ChargeBackAI\evidence\CASE001,,15-Feb-26,600091,UPI,amazon,,1,263.65,01-Mar-26,
+CASE002,407-4729841-9313128,Ambrane Type C Wired in Ear Earphones,https://www.amazon.in,7200370264,nevemadhu,Completed,C:\projects-1\ChargeBackAI\evidence\CASE002,,16 December 2025,600091,UPI,amazon,"Dec 22, 2025",1.0,354.00,,
+CASE003,OD222915018370162000,Correct English How to Write,https://www.flipkart.com,nevedhavageesan@gmail.com,none,Completed,C:\projects-1\ChargeBackAI\evidence\CASE003,,22-Sep-21,560103,Net Banking,flipkart,,1,248,,
