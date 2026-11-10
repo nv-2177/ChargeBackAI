@@ -86,7 +86,58 @@ PLATFORM_CONFIGS = {
         "print_summary_url": None,
         "security_urls": [],
         "security_selectors": [],
-    }
+    },  # <-- this comma was missing (syntax error)
+
+    # ------------------------------------------------------------------ Ticketing
+    # Zendesk AGENT WORKSPACE. Platform_URL in tickets.csv must be the subdomain
+    # URL, e.g. https://acme.zendesk.com  (only scheme + host are used).
+    # NOTE: selectors below are best-effort and UNVERIFIED against your account's
+    # sign-in page; send me the sign-in page HTML if any of them miss.
+    "zendesk": {
+        "base_url": "",                      # always taken from Platform_URL per row
+        "login_flow": "password",
+        "type": "ticketing",
+        "tickets_url": "/agent/",            # hitting this while logged out redirects to sign-in
+        # "customer sign in" link on the agent sign-in page (clicked only if visible)
+        "customer_signin_link": [
+            "text=/customer sign.?in/i",
+            "text=/sign in as (a )?customer/i",
+            "text=/end.?user/i",
+        ],
+        "email_input": ["#user_email", "input[name='user[email]']", "input[type='email']"],
+        "continue_btn": ["button:has-text('Next')", "button:has-text('Continue')"],
+        "password_input": ["#user_password", "input[name='user[password]']", "input[type='password']"],
+        "submit_btn": ["#sign-in-submit-button", "button[type='submit']", "input[type='submit']"],
+        "reauth_markers": ["/auth/", "/access/unauthenticated", "/login", "/signin"],
+
+        "direct_ticket_url": "/agent/tickets/{ticket_id}",
+        # Session-cookie JSON endpoints (same login as the browser):
+        "api_me_url": "/api/v2/users/me.json",
+        "api_ticket_url": "/api/v2/tickets/{ticket_id}.json?include=metric_sets",
+        "api_comments_url": "/api/v2/tickets/{ticket_id}/comments.json",
+        # Only used if the account that signs in turns out to be an end-user (not an agent):
+        "direct_ticket_url_enduser": "/hc/en-us/requests/{ticket_id}",
+        "api_ticket_url_enduser": "/api/v2/requests/{ticket_id}.json",
+        "api_comments_url_enduser": "/api/v2/requests/{ticket_id}/comments.json",
+
+        "attachment_href_regex": r"/attachments/|/attachments/token/",
+    },
+
+    # Placeholder only - untested. No API keys configured, so it runs DOM-only.
+    "jira": {
+        "base_url": "",
+        "login_flow": "password",
+        "type": "ticketing",
+        "customer_signin_link": [],
+        "email_input": ["#username"],
+        "continue_btn": ["#login-submit"],
+        "password_input": ["#password"],
+        "submit_btn": ["#login-submit"],
+        "tickets_url": "/jira/your-work",
+        "reauth_markers": ["/auth/v2/login", "/login"],
+        "direct_ticket_url": "/browse/{ticket_id}",
+        "attachment_href_regex": r"/secure/attachment/",
+    },
 }
 
 
@@ -97,12 +148,14 @@ def get_platform_config(platform_name: str) -> dict:
             "base_url": "",
             "login_flow": "password",
             "type": "generic",
-            "signin_nav": ["a:has-text('Login')", "button:has-text('Login')"],
+            "signin_nav": ["a:has-text('Login')", "a:has-text('Sign in')", "button:has-text('Login')"],
             "email_input": ["input[type='email']", "input[type='text']"],
             "password_input": ["input[type='password']"],
             "submit_btn": ["button[type='submit']"],
             "orders_nav": [],
             "orders_url": "",
+            "tickets_url": "",
+            "direct_ticket_url": "",
             "search_input": ["input[type='search']", "input[placeholder*='Search' i]"],
             "search_btn": ["button[type='submit']"],
             "security_urls": [],

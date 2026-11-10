@@ -174,3 +174,53 @@ def extract_timeline_dates(text: str) -> dict:
         "pincode": pincode,
         "payment_method": pay_method,
     }
+# ---------------------------------------------------------------------------
+# In agents/evidence_utils.py:
+#   1. DELETE the old "# Add to agents/evidence_utils.py" comment and the old
+#      extract_ticket_details() at the bottom of the file.
+#   2. PASTE everything below at the bottom. Nothing else in the file changes.
+# (re, datetime and timezone are already imported at the top of that file.)
+# ---------------------------------------------------------------------------
+
+def normalize_iso(value) -> str:
+    """'2026-11-10T05:45:48.000Z' -> '2026-11-10T05:45:48+00:00' (same style as utc_now)."""
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    except ValueError:
+        return str(value).strip()
+
+
+def extract_ticket_details(text: str, timestamps: list | None = None) -> dict:
+    """
+    DOM fallback, used only when the JSON API didn't supply a value.
+    status/priority come from the page text; created_date is the earliest
+    <time datetime="..."> on the page. resolved_date is NOT guessed.
+    """
+    status = ""
+    m = re.search(r"\bStatus\b\s*[:\-]?\s*(New|Open|Pending|On-hold|On hold|Solved|Closed)\b", text, re.I)
+    if m:
+        status = m.group(1)
+
+    priority = ""
+    m = re.search(r"\bPriority\b\s*[:\-]?\s*(Low|Normal|High|Urgent)\b", text, re.I)
+    if m:
+        priority = m.group(1)
+
+    parsed = []
+    for ts in timestamps or []:
+        iso = normalize_iso(ts)
+        if iso:
+            parsed.append(iso)
+    created_date = min(parsed) if parsed else ""
+
+    return {
+        "status": status,
+        "priority": priority,
+        "created_date": created_date,
+        "resolved_date": "",
+    }
