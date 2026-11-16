@@ -130,21 +130,61 @@ PLATFORM_CONFIGS = {
         "attachment_href_regex": r"/attachments/|/attachments/token/",
     },
 
-    # Placeholder only - untested. No API keys configured, so it runs DOM-only.
+    # Jira Cloud / Jira Server. Platform_URL = https://yourteam.atlassian.net ; Ticket_ID = issue key (PROJ-123).
+    # UNVERIFIED against a live account: the REST calls reuse the browser session cookie. If the API
+    # calls fail the agent silently falls back to reading the page (DOM), so evidence is still collected.
     "jira": {
         "base_url": "",
         "login_flow": "password",
         "type": "ticketing",
+        "api_style": "jira",
         "customer_signin_link": [],
-        "email_input": ["#username"],
+        "email_input": ["#username", "input[name='username']", "input[type='email']"],
         "continue_btn": ["#login-submit"],
-        "password_input": ["#password"],
+        "password_input": ["#password", "input[type='password']"],
         "submit_btn": ["#login-submit"],
         "tickets_url": "/jira/your-work",
-        "reauth_markers": ["/auth/v2/login", "/login"],
+        "reauth_markers": ["/auth/v2/login", "/login", "id.atlassian.com"],
         "direct_ticket_url": "/browse/{ticket_id}",
-        "attachment_href_regex": r"/secure/attachment/",
+        "api_me_url": "/rest/api/3/myself",
+        "api_ticket_url": "/rest/api/3/issue/{ticket_id}",
+        "api_comments_url": "/rest/api/3/issue/{ticket_id}/comment?maxResults=100",
+        "attachment_href_regex": r"/secure/attachment/|/rest/api/\d+/attachment/content/",
     },
+
+    # Freshdesk agent portal. UNVERIFIED. Freshdesk's API needs an API key (not a session cookie), so this
+    # runs DOM-only: status / priority / created date are read from the page.
+    "freshdesk": {
+        "base_url": "",
+        "login_flow": "password",
+        "type": "ticketing",
+        "customer_signin_link": [],
+        "email_input": ["#user_session_email", "input[name='user_session[email]']", "input[type='email']"],
+        "continue_btn": ["button:has-text('Next')", "button:has-text('Continue')"],
+        "password_input": ["#user_session_password", "input[type='password']"],
+        "submit_btn": ["input[type='submit']", "button[type='submit']"],
+        "tickets_url": "/a/tickets",
+        "reauth_markers": ["/login", "/support/login", "/sso"],
+        "direct_ticket_url": "/a/tickets/{ticket_id}",
+        "direct_ticket_url_enduser": "/support/tickets/{ticket_id}",
+        "attachment_href_regex": r"/attachments/|/helpdesk/attachments/",
+    },
+
+    # ------------------------------------------------------------------ More e-commerce (UNVERIFIED)
+    # Only base URL + order-list URL are given. Everything else (sign-in, finding the order) is learned
+    # by the generic keyword discovery on the first run and then replayed. OTP sites pause for the code.
+    "myntra":   {"base_url": "https://www.myntra.com", "login_flow": "otp", "type": "ecommerce",
+                 "orders_url": "/my/orders", "reauth_markers": ["/login"], "order_id_regex": r"\d{10,}",
+                 "security_urls": [], "security_selectors": []},
+    "ajio":     {"base_url": "https://www.ajio.com", "login_flow": "otp", "type": "ecommerce",
+                 "orders_url": "/my-account/order-history", "reauth_markers": ["/login"],
+                 "security_urls": [], "security_selectors": []},
+    "snapdeal": {"base_url": "https://www.snapdeal.com", "login_flow": "otp", "type": "ecommerce",
+                 "orders_url": "/myorders", "reauth_markers": ["/login"],
+                 "security_urls": [], "security_selectors": []},
+    "meesho":   {"base_url": "https://www.meesho.com", "login_flow": "otp", "type": "ecommerce",
+                 "orders_url": "/my-orders", "reauth_markers": ["/login"],
+                 "security_urls": [], "security_selectors": []},
 }
 
 
@@ -165,10 +205,20 @@ def get_platform_config(platform_name: str) -> dict:
             "direct_ticket_url": "",
             "search_input": ["input[type='search']", "input[placeholder*='Search' i]"],
             "search_btn": ["button[type='submit']"],
+            "reauth_markers": ["/login", "/signin", "/sign-in", "/auth/"],
             "security_urls": [],
             "security_selectors": [],
         }
     return PLATFORM_CONFIGS[key]
+
+
+# Used by the ticket agent for a ticketing site that has no entry above. The first visit uses generic keyword
+# discovery ("my tickets" -> link containing the ticket id -> search box); these URLs are tried only if that fails.
+GENERIC_TICKET_HINTS = [
+    "/agent/tickets/{ticket_id}", "/a/tickets/{ticket_id}", "/tickets/{ticket_id}",
+    "/hc/en-us/requests/{ticket_id}", "/support/tickets/{ticket_id}", "/browse/{ticket_id}",
+    "/ticket/{ticket_id}", "/requests/{ticket_id}",
+]
 
 
 def resolve_platform_url(config: dict, url_setting: str, platform_url: str = "", **values) -> str:

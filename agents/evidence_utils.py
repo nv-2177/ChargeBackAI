@@ -231,7 +231,32 @@ def normalize_iso(value) -> str:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
     except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):     # Jira: 2026-11-10T11:15:48.000+0530
+            try:
+                return datetime.strptime(str(value).strip(), fmt).astimezone(timezone.utc).isoformat(timespec="seconds")
+            except ValueError:
+                continue
         return str(value).strip()
+
+
+# Vocabularies of common ticketing tools (Zendesk, Jira, Freshdesk, ServiceNow, generic helpdesks).
+_STATUS_WORDS = (r"New|Open|Pending|On[- ]hold|Solved|Closed|Resolved|Reopened|To Do|In Progress|Done|Waiting(?: for \w+)?|"
+                 r"Backlog|In Review|Canceled|Cancelled|Escalated|Work in progress|Awaiting [\w ]{3,25}")
+_PRIORITY_WORDS = r"Lowest|Low|Normal|Medium|High|Highest|Urgent|Critical|Blocker|Major|Minor|Trivial|P[0-5]"
+
+
+def _labelled_value(text: str, label: str, words: str) -> str:
+    """Value of a 'Label: value' pair, or of a label that stands alone with the value on the next line."""
+    m = re.search(rf"\b{label}\b\s*[:\-]?\s*({words})\b", text, re.I)
+    if m:
+        return m.group(1).strip()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for i, line in enumerate(lines[:-1]):
+        if re.fullmatch(rf"{label}\s*:?", line, re.I):
+            nxt = lines[i + 1]
+            if re.fullmatch(words, nxt, re.I):
+                return nxt
+    return ""
 
 
 def extract_ticket_details(text: str, timestamps: list | None = None) -> dict:
@@ -240,15 +265,8 @@ def extract_ticket_details(text: str, timestamps: list | None = None) -> dict:
     status/priority come from the page text; created_date is the earliest
     <time datetime="..."> on the page. resolved_date is NOT guessed.
     """
-    status = ""
-    m = re.search(r"\bStatus\b\s*[:\-]?\s*(New|Open|Pending|On-hold|On hold|Solved|Closed)\b", text, re.I)
-    if m:
-        status = m.group(1)
-
-    priority = ""
-    m = re.search(r"\bPriority\b\s*[:\-]?\s*(Low|Normal|High|Urgent)\b", text, re.I)
-    if m:
-        priority = m.group(1)
+    status = _labelled_value(text, "Status", _STATUS_WORDS)
+    priority = _labelled_value(text, "Priority", _PRIORITY_WORDS)
 
     parsed = [iso for iso in (normalize_iso(ts) for ts in (timestamps or [])) if iso]
     created_date = min(parsed) if parsed else ""

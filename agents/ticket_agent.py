@@ -10,7 +10,7 @@ from playwright.sync_api import (
     sync_playwright, Page, TimeoutError as PlaywrightTimeout, Error as PlaywrightError,
 )
 
-from config.platforms import get_platform_config, resolve_platform_url
+from config.platforms import get_platform_config, resolve_platform_url, GENERIC_TICKET_HINTS
 from agents.path_learner import PathNavigator, StepFailure
 from agents.browser_pool import get_pool
 from agents.fast_utils import Timer, wait_page_ready
@@ -38,10 +38,18 @@ class TicketBrowserAgent:
     def __init__(self, platform_name: str, evidence_dir: Path, headless: bool = True, profile_dir: Path | None = None):
         self.platform = str(platform_name).strip().lower()
         self.config = get_platform_config(platform_name)
-        if self.config.get("type") != "ticketing":
+        self.generic = False
+        if self.config.get("type") == "generic":
+            # Platform not listed in config/platforms.py: main.py's "tickets" mode already says this is a
+            # ticketing site, so run with generic keyword discovery + DOM extraction (no vendor API).
+            self.generic = True
+            self.config = {**self.config, "type": "ticketing", "customer_signin_link": []}
+        elif self.config.get("type") != "ticketing":
             raise TicketAgentError(
-                f"Platform '{platform_name}' is not configured as a ticketing platform in config/platforms.py"
+                f"Platform '{platform_name}' is configured as '{self.config.get('type')}', not as a ticketing platform "
+                "in config/platforms.py (use the e-commerce mode for it)"
             )
+        self._extra_attachments: list = []
         self.evidence_dir = Path(evidence_dir)
         (self.evidence_dir / "screenshots").mkdir(parents=True, exist_ok=True)
         (self.evidence_dir / "documents").mkdir(parents=True, exist_ok=True)
@@ -242,7 +250,8 @@ class TicketBrowserAgent:
 
     def go_to_ticket(self, ticket_id: str, soft: bool = False):
         ticket_id = str(ticket_id).strip().lstrip("#")
-        hints = [self.config.get("direct_ticket_url"), self.config.get("direct_ticket_url_enduser")]
+        hints = ([self.config.get("direct_ticket_url"), self.config.get("direct_ticket_url_enduser")]
+                 if not self.generic else list(GENERIC_TICKET_HINTS))
         nav = PathNavigator(
             page_fn=lambda: (self._ensure_page() or self.page),
             platform=self.platform, origin=self.platform_url, flow="tickets",
@@ -297,6 +306,11 @@ class TicketBrowserAgent:
                 grab(a.get("content_url"), a.get("file_name") or f"attachment_{a.get('id', '')}",
                      str(cmt.get("id", "")), a.get("content_type", ""), a.get("size"))
 
+        # 1b) Attachments listed on the ticket itself (Jira keeps them on the issue, not on comments)
+        for a in self._extra_attachments:
+            grab(a.get("content_url"), a.get("file_name") or f"attachment_{a.get('id', '')}", "issue",
+                 a.get("content_type", ""), a.get("size"))
+
         # 2) Fallback / supplement: attachment links visible in the DOM
         pattern = self.config.get("attachment_href_regex")
         if pattern:
@@ -325,6 +339,22 @@ class TicketBrowserAgent:
                 return best[:60]
         return ""
 
+    @staticmethod
+    def _normalize_jira(raw: dict) -> dict:
+        """Jira issue JSON -> the same shape the Zendesk code reads ({'ticket': {...}}); raw JSON kept under 'raw'."""
+        f = (raw or {}).get("fields") or {}
+        return {
+            "ticket": {
+                "status": (f.get("status") or {}).get("name") or "",
+                "priority": (f.get("priority") or {}).get("name") or "",
+                "created_at": f.get("created") or "",
+                "subject": f.get("summary") or "",
+                "_resolved": f.get("resolutiondate") or "",
+            },
+            "attachments": f.get("attachment") or [],
+            "raw": raw,
+        }
+
     def _api_ticket_bundle(self, ticket_id: str):
         """Ticket JSON + comments. Agent API first (no extra 'who am I' call); end-user API as fallback."""
         api_ticket = self._api_json(self._url("api_ticket_url", ticket_id=ticket_id), quiet=True)
@@ -334,6 +364,11 @@ class TicketBrowserAgent:
             api_ticket = self._api_json(self._url("api_ticket_url_enduser", ticket_id=ticket_id), quiet=True)
             if api_ticket is not None:
                 self.user_role = "end-user"
+        if api_ticket is not None and self.config.get("api_style") == "jira":
+            api_ticket = self._normalize_jira(api_ticket)
+            self._extra_attachments = [
+                {"content_url": a.get("content"), "file_name": a.get("filename"), "content_type": a.get("mimeType", ""),
+                 "size": a.get("size"), "id": a.get("id", "")} for a in api_ticket.get("attachments", [])]
         c_setting = "api_comments_url_enduser" if self.user_role == "end-user" else "api_comments_url"
         comments = self._api_paginated(self._url(c_setting, ticket_id=ticket_id), "comments")
         return api_ticket, comments
@@ -434,7 +469,8 @@ class TicketBrowserAgent:
                     pass
 
         t = (api_ticket or {}).get("ticket") or (api_ticket or {}).get("request") or {}
-        if not t and re.search(r"ticket not found|does not exist|don.t have (access|permission)", body_text, re.I):
+        if not t and re.search(r"ticket not found|issue does not exist|does not exist|page not found|no such (ticket|issue)|"
+                          r"can.?t view this (issue|ticket)|don.t have (access|permission)", body_text[:3000], re.I):
             raise TicketAgentError(f"Ticket {ticket_id} not found or not accessible with this account.")
         if not t and not timestamps and len(body_text.strip()) < 50:
             raise TicketAgentError(f"Ticket page for {ticket_id} did not load any content.")
@@ -445,7 +481,7 @@ class TicketBrowserAgent:
             "status": t.get("status") or "",
             "priority": t.get("priority") or "",
             "created_date": normalize_iso(t.get("created_at")),
-            "resolved_date": normalize_iso(metric.get("solved_at")),
+            "resolved_date": normalize_iso(metric.get("solved_at") or t.get("_resolved")),
         }
         dom_vals = extract_ticket_details(body_text, [x.get("datetime") for x in timestamps])
         merged, sources = {}, {}

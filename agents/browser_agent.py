@@ -238,6 +238,10 @@ class PlatformBrowserAgent:
         _, username, password = self._login_args
         c = self.config
         origin = urlsplit(self.platform_url)
+        if origin.scheme not in ("http", "https") or not origin.netloc:
+            raise BrowserAgentError(
+                f"No website URL for platform '{self.platform}': it is not in config/platforms.py, so put its "
+                "site address (e.g. https://www.example.com) in the Platform_URL column.")
         origin = f"{origin.scheme}://{origin.netloc}"
         hints = [c.get("direct_details_url"), c.get("direct_order_url"), c.get("orders_url")]
         nav = PathNavigator(

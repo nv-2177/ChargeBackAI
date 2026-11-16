@@ -54,6 +54,9 @@ LOGIN_INTENTS = {"signin", "customer_signin", "continue", "submit"}
 NEGATIVE_LOGIN = ("google", "facebook", "apple", "microsoft", "sso", "forgot", "create account",
                   "register", "sign up", "signup")
 
+_MISSING_PAGE = re.compile(r"page not found|\b404\b|not found|does not exist|doesn.t exist|no such (ticket|issue|order)|"
+                           r"can.?t (be found|view this)|don.t have (access|permission)|something went wrong", re.I)
+
 _LOGIN_PATH = re.compile(r"(sign-?in|log-?in|/auth/|/ap/|unauthenticated|/sso)", re.I)
 
 _CLICKABLE = ('a, button, [role="button"], [role="link"], [role="menuitem"], [role="tab"], '
@@ -285,6 +288,23 @@ class PathNavigator:
             if time.time() >= deadline:
                 return False
             p.wait_for_timeout(120)
+
+    def _page_missing(self) -> bool:
+        """True for a short error page ('not found', 'no access'). Used while LEARNING from a guessed URL: the id is
+        in the URL of a 404 too, so 'id in URL' alone must not be accepted as success."""
+        p = self._p()
+        end = time.time() + 2.5
+        txt = ""
+        while time.time() < end:
+            try:
+                txt = p.locator("body").inner_text(timeout=1_000)
+            except Exception:
+                txt = ""
+            if len(txt.strip()) > 40:
+                break
+            p.wait_for_timeout(150)
+        txt = txt.strip()
+        return bool(_MISSING_PAGE.search(txt[:1500])) and len(txt) < 1500
 
     def _is_final_page(self) -> bool:
         url = self._p().url.lower()
@@ -776,6 +796,8 @@ class PathNavigator:
                 self._exec(steps[0])
                 self._ensure_session(steps)
                 self._hops(steps)
+                if self._page_missing():
+                    raise StepFailure(f"{h} opened an error / not-found page")
                 return steps
             except (StepFailure, LoginRequired) as ex:
                 last = ex
