@@ -1,0 +1,2 @@
+case id,platform,platform_url,ticket id,subject,username,password,processing_status,error_message,evidence_folder,subject_match,ticket_status,priority,created_date,resolved_date
+TC_001,zendesk,https://chennaiinstituteoftechnology-23395.zendesk.com/,#1,Test Ticket: Unable to reset password on portal,nevedhav.cse2025@citchennai.net,welcometocit,Completed,,C:\projects-1\ChargeBackAI\evidence\TC_001,1.0,open,normal,2026-11-10T05:45:48+00:00,

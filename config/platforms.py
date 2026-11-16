@@ -73,7 +73,14 @@ PLATFORM_CONFIGS = {
         "search_btn": ["button:has-text('Search Orders')", "button:has-text('Search')", "button[type='submit']"],
         "order_id_regex": r"OD\d{10,}",
         "order_card": ["div[class*='OrderCard']", "div[class*='_2pt2v']", "div[class*='row']", "a[href*='order_id=']"],
-        "details_link": ["a[href*='order_details']", "a[href*='/rv/orders']", "a[href*='order_id=']"],
+        "details_link": [
+        "a[href*='order_details']",
+        "a[href*='/rv/orders']",
+        "a[href*='order_id=']",
+        "a:has-text('Order Details')",
+        "a:has-text('View Details')",
+        "button:has-text('Order Details')",
+        "button:has-text('View Details')",],
         "return_status_link": [
             "a:has-text('View Return/Refund Status')",
             "a:has-text('Return Status')", "a:has-text('Refund Status')",

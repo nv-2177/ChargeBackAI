@@ -2,6 +2,7 @@
 import logging
 import re
 import time
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -10,6 +11,9 @@ from playwright.sync_api import (
 )
 
 from config.platforms import get_platform_config, resolve_platform_url
+from agents.path_learner import PathNavigator, StepFailure
+from agents.browser_pool import get_pool
+from agents.fast_utils import Timer, wait_page_ready
 from agents.evidence_utils import (
     extract_ticket_details, match_product, normalize_iso, utc_now, write_json,
 )
@@ -50,62 +54,79 @@ class TicketBrowserAgent:
         self.details: dict = {}
         self.platform_url = ""
         self.user_role = ""
+        self._creds = ("", "")
+        self._start_url = ""
+        self._filters_on = False
+        self._warm_key = None
+        self._is_warm = False
+        self._soft_used = False
+        self._req_log: list = []
 
     # ------------------------------------------------------------ lifecycle
     def start(self):
-        self._pw = sync_playwright().start()
-        args = ["--start-maximized", "--disable-blink-features=AutomationControlled"]
-        ctx_kw = dict(no_viewport=True, locale="en-IN", timezone_id="Asia/Kolkata")
+        t0 = time.perf_counter()
+        self.pool = get_pool()
+        self.context = self.pool.context(self.profile_dir, self.headless)   # already running after the first case
+        self.browser = None
+        self.page = self.pool.page(self.context)                           # new tab: milliseconds
+        self._req_log = self.pool.req_log(self.page)
+        self._install_filters()
+        self.details.setdefault("timings_ms", {})["browser_start"] = int((time.perf_counter() - t0) * 1000)
 
-        if self.profile_dir:
-            self.profile_dir.mkdir(parents=True, exist_ok=True)
-            for channel in ("chrome", None):  # installed Chrome first, bundled Chromium as fallback
-                try:
-                    kw = dict(headless=self.headless, args=args,
-                              ignore_default_args=["--enable-automation"], **ctx_kw)
-                    if channel:
-                        kw["channel"] = channel
-                    self.context = self._pw.chromium.launch_persistent_context(str(self.profile_dir), **kw)
-                    log.info(f"[{self.platform}] Browser started ({channel or 'bundled chromium'}).")
-                    break
-                except Exception as e:
-                    log.warning(f"[{self.platform}] Launch with channel={channel} failed: {e}")
-
-        if self.context is None:
-            try:
-                self.browser = self._pw.chromium.launch(channel="chrome", headless=self.headless, args=args)
-            except PlaywrightError:
-                self.browser = self._pw.chromium.launch(headless=self.headless, args=args)
-            self.context = self.browser.new_context(**ctx_kw)
-        else:
-            self.browser = self.context.browser
-
-        self.context.set_default_timeout(5_000)
-        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+    def _allowed_hosts(self) -> list:
+        hosts = list(self.config.get("allow_hosts") or [])
+        own = urlsplit(self.platform_url).hostname if self.platform_url else ""
+        if own:
+            hosts.append(own)
+        return hosts
 
     def _install_filters(self):
-        """Block media/fonts, but only AFTER sign-in so 2FA/verification pages are never touched.
-        Images and analytics URLs are NOT blocked (screenshots show inline images)."""
+        """Speed filters: always block media/fonts; with block_third_party also block every request to a host
+        that is not the account's own or in allow_hosts (analytics, tag managers, chat widgets...).
+        Removed while signing in (2FA/captcha pages stay untouched) and re-installed afterwards by the
+        PathNavigator login hooks. Images are NOT blocked: screenshots show inline images."""
+        block_3p = bool(self.config.get("block_third_party"))
+
         def _block(route):
-            if route.request.resource_type in ("media", "font"):
+            req = route.request
+            if req.resource_type in ("media", "font"):
                 route.abort()
-            else:
-                route.continue_()
+                return
+            if block_3p and req.resource_type != "document" and not req.url.startswith(("data:", "blob:", "about:")):
+                host = urlsplit(req.url).hostname or ""
+                allowed = self._allowed_hosts()
+                if allowed and not any(host == h or host.endswith("." + h) for h in allowed):
+                    route.abort()
+                    return
+            route.continue_()
 
         self.page.route("**/*", _block)
+        self._filters_on = True
+
+    def _remove_filters(self):
+        if self._filters_on:
+            try:
+                self.page.unroute("**/*")
+            except Exception:
+                pass
+            self._filters_on = False
 
     def close(self):
-        for obj in (self.context, self.browser):
-            try:
-                if obj:
-                    obj.close()
-            except Exception:
-                pass
-        if self._pw:
-            try:
-                self._pw.stop()
-            except Exception:
-                pass
+        """Hand the tab back; the browser stays running. After a good run on a warm_tab platform the tab is kept
+        (app still loaded) so the next ticket does not pay the app's start-up cost again."""
+        pool = getattr(self, "pool", None)
+        if pool is None or self.page is None:
+            return
+        keep = False
+        try:
+            keep = bool(self.config.get("warm_tab") and self._warm_key and self.details.get("page_ready")
+                        and self.details.get("ticket_details") and not self.page.is_closed())
+        except Exception:
+            pass
+        if keep:
+            pool.keep_warm(self._warm_key, self.page)
+        else:
+            pool.release(self.context, self.page)
 
     # ------------------------------------------------------------ helpers
     def _ensure_page(self):
@@ -176,6 +197,8 @@ class TicketBrowserAgent:
             return None
 
     def _api_paginated(self, url: str, key: str, max_pages: int = 50) -> list | None:
+        if not url:
+            return None
         items, pages = [], 0
         while url and pages < max_pages:
             data = self._api_json(url)
@@ -186,101 +209,57 @@ class TicketBrowserAgent:
             pages += 1
         return items
 
-    # ------------------------------------------------------------ session / login
+    # ------------------------------------------------------------ session / navigation (learned paths)
     def _session_ok(self) -> bool:
-        """True if the saved profile already holds a valid session."""
+        """API check, used only to learn the account role (agent vs end-user)."""
         me_url = self._url("api_me_url")
-        if me_url:
-            user = (self._api_json(me_url, quiet=True) or {}).get("user") or {}
-            if user.get("id"):
-                self.user_role = str(user.get("role") or "")
-                return True
+        if not me_url:
             return False
-        # No API configured: navigate and look for sign-in redirects.
-        try:
-            self.page.goto(self._url("tickets_url") or self.platform_url, wait_until="commit")
-            self._settle(1500)
-            url = self.page.url.lower()
-            return not any(m in url for m in self.config.get("reauth_markers", []))
-        except Exception:
-            return False
+        user = (self._api_json(me_url, quiet=True) or {}).get("user") or {}
+        if user.get("id"):
+            self.user_role = str(user.get("role") or "")
+            return True
+        return False
 
     def login(self, target_url: str, username: str, password: str):
-        self._login(target_url, username, password)
-        self._install_filters()
-
-    def _login(self, target_url: str, username: str, password: str):
+        """Sign-in is deferred: the learned path signs in only if the saved session is not valid."""
         self.platform_url = _origin(target_url)
         if not self.platform_url:
             raise TicketAgentError(
                 "Platform_URL must be the full URL with subdomain, e.g. https://acme.zendesk.com")
+        self._start_url = str(target_url).strip()
+        self._creds = (username, password)
+        if self.config.get("warm_tab") and getattr(self, "pool", None) is not None:
+            self._warm_key = f"{id(self.context)}|{self.platform_url}"
+            warm = self.pool.take_warm(self._warm_key)
+            if warm is not None:
+                if self.page is not None and self.page is not warm:
+                    self.pool.release(self.context, self.page)   # the blank tab start() opened
+                self.page = warm
+                self._req_log = self.pool.req_log(warm)
+                self._filters_on = True                          # the filters are still registered on this tab
+                self._is_warm = True
 
-        if self._session_ok():
-            log.info(f"[{self.platform}] Active session found, skipping sign-in (role={self.user_role or 'unknown'}).")
-            return
-
-        log.info(f"[{self.platform}] No valid session. Signing in...")
-        c = self.config
-        self.page.goto(self._url("tickets_url") or self.platform_url, wait_until="commit")
-        self._settle(1000)
-
-        # "Customer sign in" link on the agent sign-in page, only if present
-        cust = self._wait_visible(c.get("customer_signin_link"), 2_000)
-        if cust:
-            cust.click()
-            self._settle(500)
-
-        email = self._wait_visible(c.get("email_input"), 6_000)
-        if not email:
-            raise TicketAgentError("Sign-in email field not found; check email_input selectors in config/platforms.py")
-        email.fill(username)
-
-        pw = self._wait_visible(c.get("password_input"), 1_500)
-        if not pw:  # two-step form: email first, then password
-            nxt = self._first_visible(c.get("continue_btn"))
-            if nxt:
-                nxt.click()
-            else:
-                email.press("Enter")
-            self._settle(400)
-            pw = self._wait_visible(c.get("password_input"), 5_000)
-        if not pw:
-            raise TicketAgentError("Sign-in password field not found; check password_input selectors.")
-        pw.fill(password)
-
-        sub = self._first_visible(c.get("submit_btn"))
-        if sub:
-            sub.click()
-        else:
-            pw.press("Enter")
-        self._settle(1500)
-
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            if self._session_ok():
-                return
-            self.page.wait_for_timeout(500)
-
-        # Captcha / 2FA / SSO: hand over to the human
-        print(f"\n[VERIFICATION REQUIRED] Finish signing in for {username} in the browser window.")
-        input(">>> Press ENTER after you are signed in... ")
-        if not self._session_ok():
-            raise TicketAgentError("Login failed: no valid session after sign-in.")
-
-    # ------------------------------------------------------------ navigation
-    def go_to_ticket(self, ticket_id: str):
-        url = self._url(self._role_setting("direct_ticket_url"), ticket_id=ticket_id)
-        if not url:
-            raise TicketAgentError(f"No direct_ticket_url configured for platform '{self.platform}'.")
-        self.page.goto(url, wait_until="commit")
-        self._settle(500)
-        try:  # the agent workspace is a SPA; let its XHRs finish
-            self.page.wait_for_load_state("networkidle", timeout=8_000)
-        except PlaywrightTimeout:
-            pass
-        cur = self.page.url.lower()
-        if any(m in cur for m in self.config.get("reauth_markers", [])):
-            raise TicketAgentError(f"Session lost while opening ticket {ticket_id} (redirected to {self.page.url}).")
+    def go_to_ticket(self, ticket_id: str, soft: bool = False):
+        ticket_id = str(ticket_id).strip().lstrip("#")
+        hints = [self.config.get("direct_ticket_url"), self.config.get("direct_ticket_url_enduser")]
+        nav = PathNavigator(
+            page_fn=lambda: (self._ensure_page() or self.page),
+            platform=self.platform, origin=self.platform_url, flow="tickets",
+            target_key="ticket_id", target_value=ticket_id,
+            start_url=self._start_url, username=self._creds[0], password=self._creds[1],
+            hint_urls=hints,
+            on_login_start=self._remove_filters, on_login_end=self._install_filters,
+            soft_nav=bool(soft and self._is_warm),
+        )
+        self._nav = nav
+        try:
+            info = nav.open_target()
+        except StepFailure as e:
+            raise TicketAgentError(f"Could not reach ticket {ticket_id}: {e}") from e
+        self._soft_used = bool(nav.soft_navigated)
+        self.details["path_mode"] = info["mode"]      # learned:keywords | learned:config_hint | replay:fast_path | replay:steps
+        self.details["path_key"] = nav.key
 
     # ------------------------------------------------------------ evidence
     def _download(self, url: str, dest: Path) -> tuple[bool, str]:
@@ -331,43 +310,128 @@ class TicketBrowserAgent:
                     grab(h["href"], h["text"] or h["href"].rsplit("/", 1)[-1].split("?")[0] or "attachment")
         return records
 
+    @staticmethod
+    def _anchor_text(comments) -> str:
+        """A distinctive line from this ticket's own first comment (not a greeting): lets us recognise the
+        right ticket on screen. Empty if the ticket has no usable text (then no in-app jump is attempted)."""
+        for c in comments or []:
+            lines = []
+            for line in re.split(r"[\r\n]+", c.get("plain_body") or ""):
+                line = re.sub(r"\s+", " ", line).strip()
+                if line:
+                    lines.append(line)
+            best = max(lines[:8], key=len, default="")
+            if len(best) >= 15:
+                return best[:60]
+        return ""
+
+    def _api_ticket_bundle(self, ticket_id: str):
+        """Ticket JSON + comments. Agent API first (no extra 'who am I' call); end-user API as fallback."""
+        api_ticket = self._api_json(self._url("api_ticket_url", ticket_id=ticket_id), quiet=True)
+        if api_ticket is not None:
+            self.user_role = self.user_role or "agent"
+        elif self.config.get("api_ticket_url_enduser"):
+            api_ticket = self._api_json(self._url("api_ticket_url_enduser", ticket_id=ticket_id), quiet=True)
+            if api_ticket is not None:
+                self.user_role = "end-user"
+        c_setting = "api_comments_url_enduser" if self.user_role == "end-user" else "api_comments_url"
+        comments = self._api_paginated(self._url(c_setting, ticket_id=ticket_id), "comments")
+        return api_ticket, comments
+
     def collect_ticket_evidence(self, case_id: str, ticket_id: str, subject_query: str) -> dict:
         ticket_id = str(ticket_id).strip().lstrip("#")
+        tm = Timer()
         d = self.details
         d.update({
             "case_id": case_id,
             "ticket_id": ticket_id,
             "expected_subject": subject_query,
             "platform": self.platform,
-            "login_role": self.user_role,
             "pages": {},
             "attachments": [],
             "collected_at_utc": utc_now(),
         })
         docs = self.evidence_dir / "documents"
 
-        self.go_to_ticket(ticket_id)
+        del self._req_log[:]
+
+        def load_api():
+            with tm.phase("api"):
+                at, cm = self._api_ticket_bundle(ticket_id)
+                if at is not None:
+                    write_json(docs / f"api_ticket_{ticket_id}.json", at)
+                if cm is not None:
+                    write_json(docs / f"api_comments_{ticket_id}.json", {"comments": cm})
+            return at, cm
+
+        # Warm tab: fetch the data FIRST, so the new ticket can be recognised on screen by its own text.
+        # Cold tab: open the page first; it renders while the data requests run.
+        api_ticket, comments, anchor = None, None, ""
+        if self._is_warm:
+            api_ticket, comments = load_api()
+            anchor = self._anchor_text(comments)
+        with tm.phase("open_ticket"):
+            self.go_to_ticket(ticket_id, soft=bool(anchor))
         d["pages"]["ticket_details"] = self.page.url
+        if not self._is_warm:
+            api_ticket, comments = load_api()
+            anchor = self._anchor_text(comments)
+        d["login_role"] = self.user_role
 
-        # --- structured data via the signed-in session
-        api_ticket = self._api_json(self._url(self._role_setting("api_ticket_url"), ticket_id=ticket_id))
-        comments = self._api_paginated(
-            self._url(self._role_setting("api_comments_url"), ticket_id=ticket_id), "comments")
-        if api_ticket is not None:
-            write_json(docs / f"api_ticket_{ticket_id}.json", api_ticket)
-        if comments is not None:
-            write_json(docs / f"api_comments_{ticket_id}.json", {"comments": comments})
+        # Screenshot / DOM are taken ONLY after the ticket page has really rendered: its own content is on screen
+        # (text from this ticket, a timestamp or its id) and the text has stopped changing.
+        with tm.phase("page_ready"):
+            cold_kw = dict(any_of_selectors=["time[datetime]"],
+                           any_of_texts=[x for x in (anchor, ticket_id) if x], timeout_ms=3_500)
+            nav = getattr(self, "_nav", None)
+            if self._soft_used:
+                # strict: the previous ticket's DOM is still on screen, so only this ticket's own text counts
+                ready = wait_page_ready(self.page, any_of_texts=[anchor], timeout_ms=2_500)
+                if nav is not None:
+                    nav.entry["soft_nav"] = "works" if ready else "fails"   # remembered: never retried if it fails
+                    nav._save()
+                d["soft_nav"] = "works" if ready else "fell_back_to_full_load"
+                if not ready:
+                    self.page.goto(self.page.url, wait_until="commit")
+                    self._soft_used = False
+                    ready = wait_page_ready(self.page, **cold_kw)
+            else:
+                ready = wait_page_ready(self.page, **cold_kw)
+            if nav is not None:
+                try:
+                    if nav.recheck():        # the quick jump was bounced to sign-in: signed in, reopened, wait again
+                        d["pages"]["ticket_details"] = self.page.url
+                        ready = wait_page_ready(self.page, **cold_kw)
+                except Exception as e:
+                    log.warning(f"[{ticket_id}] session re-check failed: {e}")
+            d["page_ready"] = ready
+            d["page_ready_diag"] = dict(getattr(wait_page_ready, "last", {}) or {})
+            if not ready:
+                log.warning(f"[{ticket_id}] ticket page not ready ({d['page_ready_diag']}); capturing anyway (flagged).")
 
-        # --- DOM
-        body_text = self.page.locator("body").inner_text()
-        d["raw_text"] = body_text
-        try:
-            timestamps = self.page.eval_on_selector_all(
-                "time[datetime]",
-                "els => els.map(e => ({text: (e.innerText||'').trim(), datetime: e.getAttribute('datetime')}))")
-        except Exception:
-            timestamps = []
-        d["dom_timestamps"] = timestamps
+        with tm.phase("read_dom"):
+            body_text = self.page.locator("body").inner_text()
+            d["raw_text"] = body_text
+            try:
+                timestamps = self.page.eval_on_selector_all(
+                    "time[datetime]",
+                    "els => els.map(e => ({text: (e.innerText||'').trim(), datetime: e.getAttribute('datetime')}))")
+            except Exception:
+                timestamps = []
+            d["dom_timestamps"] = timestamps
+
+        # Evidence artifacts, captured right after the readiness check, before anything else touches the page
+        with tm.phase("screenshot"):
+            self.page.screenshot(path=str(self.evidence_dir / "screenshots" / "ticket_details_page.png"),
+                                 type="jpeg", quality=60, scale="css")
+            d["screenshot_taken_after_ready"] = bool(d["page_ready"])
+        with tm.phase("dom_dump"):
+            (docs / "dom_ticket_details.html").write_text(self.page.content(), encoding="utf-8")
+            for n, fr in enumerate(self.page.frames[1:7], start=1):  # iframes (composer, apps, etc.)
+                try:
+                    (docs / f"dom_frame_{n}.html").write_text(fr.content(), encoding="utf-8")
+                except Exception:
+                    pass
 
         t = (api_ticket or {}).get("ticket") or (api_ticket or {}).get("request") or {}
         if not t and re.search(r"ticket not found|does not exist|don.t have (access|permission)", body_text, re.I):
@@ -375,7 +439,7 @@ class TicketBrowserAgent:
         if not t and not timestamps and len(body_text.strip()) < 50:
             raise TicketAgentError(f"Ticket page for {ticket_id} did not load any content.")
 
-        # --- merge: API values win, DOM fills gaps; record where each came from
+        # Merge: API values win, DOM fills gaps; record where each came from
         metric = (api_ticket or {}).get("metric_set") or ((api_ticket or {}).get("metric_sets") or [{}])[0] or {}
         api_vals = {
             "status": t.get("status") or "",
@@ -398,20 +462,30 @@ class TicketBrowserAgent:
         d["field_sources"] = sources
         d["subject_actual"] = t.get("subject") or ""
 
-        # --- subject check (recorded; main.py decides whether it fails the case)
+        # Subject check (recorded; main.py decides whether it fails the case)
         if subject_query:
             candidates = [d["subject_actual"]] if d["subject_actual"] else [body_text]
             d["subject_verification"] = match_product(subject_query, candidates)
 
-        # --- evidence artifacts
-        self.page.screenshot(path=str(self.evidence_dir / "screenshots" / "ticket_details_page.png"),
-                             type="jpeg", quality=60)
-        (docs / "dom_ticket_details.html").write_text(self.page.content(), encoding="utf-8")
-        for n, fr in enumerate(self.page.frames[1:], start=1):  # iframes (composer, apps, etc.)
-            try:
-                (docs / f"dom_frame_{n}.html").write_text(fr.content(), encoding="utf-8")
-            except Exception:
-                pass
+        with tm.phase("attachments"):
+            d["attachments"] = self._download_attachments(comments)
 
-        d["attachments"] = self._download_attachments(comments)
+        # Load diagnostics: where the page's load time went (hosts, slowest requests, browser navigation timing)
+        try:
+            reqs = list(self._req_log)
+            d["load_diag"] = {
+                "requests": len(reqs),
+                "top_hosts": Counter(r[0] for r in reqs).most_common(8),
+                "slowest_ms": [{"ms": r[2], "type": r[1], "url": r[3]}
+                               for r in sorted(reqs, key=lambda r: -r[2])[:5]],
+            }
+            d["nav_timing_ms"] = self.page.evaluate(
+                "() => { const n = performance.getEntriesByType('navigation')[0];"
+                " return n ? {response_start: Math.round(n.responseStart),"
+                " dom_content_loaded: Math.round(n.domContentLoadedEventEnd), load: Math.round(n.loadEventEnd)} : null; }")
+        except Exception:
+            pass
+
+        d.setdefault("timings_ms", {}).update(tm.marks)
+        d["timings_ms"]["collect_total"] = tm.total_ms()
         return d

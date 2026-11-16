@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import os
 import sys
 import time
 import traceback
@@ -12,6 +13,7 @@ from pydantic import BaseModel, field_validator, ValidationError
 from agents.browser_agent import PlatformBrowserAgent, BrowserAgentError
 from agents.ticket_agent import TicketBrowserAgent, TicketAgentError
 from agents.evidence_utils import utc_now, write_json, build_file_manifest
+from agents import path_learner, browser_pool
 
 BASE_DIR = Path(__file__).resolve().parent
 EVIDENCE_ROOT = BASE_DIR / "evidence"
@@ -21,6 +23,7 @@ PROFILE_ROOT = BASE_DIR / "credentials" / "profiles"
 # Ticket Subject mismatch: you didn't specify, so by default it is only RECORDED
 # (subject_match column = similarity score). Set True to mark such cases Failed.
 STRICT_SUBJECT_MATCH = False
+TIME_BUDGET_S = 5.0   # per case; slower cases are flagged in the console and in metadata.json
 
 INPUT_FILES = {
     "orders": ("orders.csv", "orders.xlsx"),
@@ -30,7 +33,7 @@ INPUT_FILES = {
 OUTPUT_COLS = [
     "processing_status", "error_message", "evidence_folder", "product_match",
     "order_date", "price", "pincode", "payment_method",
-    "replacement_initialization", "replacement_date", "replacement_window",
+    "replacement_initialization", "replacement_date", "replacement_window", "order_source",
 ]
 TICKET_OUTPUT_COLS = [
     "processing_status", "error_message", "evidence_folder", "subject_match",
@@ -46,6 +49,7 @@ class OrderCase(BaseModel):
     Product_Name: str
     Username: str
     Password: str = ""
+    Order_URL: str = ""      # optional: complete shared order-details link (Flipkart)
 
     @field_validator("Case_ID", "Platform", "Order_ID", "Product_Name", "Username", mode="before")
     @classmethod
@@ -54,7 +58,7 @@ class OrderCase(BaseModel):
             raise ValueError("must not be empty")
         return str(v).strip()
 
-    @field_validator("Password", "Platform_URL", mode="before")
+    @field_validator("Password", "Platform_URL", "Order_URL", mode="before")
     @classmethod
     def clean_optional(cls, v):
         return "" if v is None or str(v).strip().lower() in ("", "nan", "none") else str(v).strip()
@@ -173,9 +177,19 @@ def write_case_files(case_dir: Path, case, agent, started_at: str, outcome: str,
     else:
         meta.update({
             "order_id": case.Order_ID,
+            "order_source": details.get("order_source"),
+            "order_details_url": details.get("order_details_url_full"),
+            "shared_url": details.get("shared_url"),
             "timeline": details.get("timeline", {}),
             "invoices": details.get("invoices"),
         })
+    meta["timings_ms"] = details.get("timings_ms", {})
+    meta["evidence_checklist"] = {
+        "page_ready_before_capture": details.get("page_ready"),
+        "screenshot": any((case_dir / "screenshots").glob("*")),
+        "dom_html": any((case_dir / "documents").glob("dom_*.html")),
+        "details_json": True,
+    }
     meta["files"] = build_file_manifest(case_dir)
     write_json(case_dir / "metadata.json", meta)
 
@@ -193,6 +207,23 @@ def _profile_dir(prefix: str, row: dict, platform_url: str = "") -> Path:
 
 
 # ------------------------------------------------------------------ e-commerce (unchanged logic)
+def _report(case_id, label, started, agent=None):
+    elapsed = time.perf_counter() - started
+    flag = "" if elapsed <= TIME_BUDGET_S else f"  [OVER the {TIME_BUDGET_S:.0f}s budget]"
+    print(f"[{case_id}] {label} fetch took {elapsed:.1f} seconds.{flag}")
+    t = (getattr(agent, "details", None) or {}).get("timings_ms") if agent else None
+    if t:
+        print(f"[{case_id}] phases (ms): " + ", ".join(f"{k}={v}" for k, v in sorted(t.items(), key=lambda kv: -kv[1])))
+    dt = getattr(agent, "details", None) or {}
+    ld = dt.get("load_diag")
+    if ld:
+        print(f"[{case_id}] page load: {ld['requests']} requests; top hosts: "
+              + ", ".join(f"{h}={n}" for h, n in ld["top_hosts"][:5])
+              + "; slowest: " + ", ".join(f"{s['ms']}ms {s['url'][:70]}" for s in ld["slowest_ms"][:3]))
+    if dt.get("nav_timing_ms"):
+        print(f"[{case_id}] browser timing (ms): {dt['nav_timing_ms']}; soft_nav={dt.get('soft_nav', 'n/a')}")
+
+
 def process_case(table_path: Path, idx: int, row: dict):
     fetch_started = time.perf_counter()
     case_id = row.get("case id")
@@ -205,12 +236,13 @@ def process_case(table_path: Path, idx: int, row: dict):
             Product_Name=row.get("product name"),
             Username=row.get("username"),
             Password=row.get("password", ""),
+            Order_URL=row.get("order_url", "") or row.get("order url", ""),
         )
     except ValidationError as e:
         msg = "; ".join(f"{err['loc'][0]}: {err['msg']}" for err in e.errors())
         update_row(table_path, idx, processing_status="Failed", error_message=f"Validation error: {msg}")
         print(f"[{case_id}] Validation failed: {msg}")
-        print(f"[{case_id}] Product fetch took {time.perf_counter() - fetch_started:.1f} seconds.")
+        _report(case_id, "Product", fetch_started, locals().get("agent"))
         return
 
     case_dir = create_evidence_dirs(case.Case_ID)
@@ -219,6 +251,7 @@ def process_case(table_path: Path, idx: int, row: dict):
     profile_dir = _profile_dir("", row)
 
     started_at = utc_now()
+    setup_ms = int((time.perf_counter() - fetch_started) * 1000)
     agent = PlatformBrowserAgent(
         platform_name=case.Platform,
         evidence_dir=case_dir,
@@ -228,10 +261,15 @@ def process_case(table_path: Path, idx: int, row: dict):
     status, error = "Failed", ""
 
     try:
+        t = time.perf_counter()
         agent.start()
+        print(f"[{case.Case_ID}]   browser start : {time.perf_counter() - t:.1f}s"); t = time.perf_counter()
         agent.login(case.Platform_URL, case.Username, case.Password)
+        print(f"[{case.Case_ID}]   login/session : {time.perf_counter() - t:.1f}s"); t = time.perf_counter()
         agent.go_to_orders()
-        agent.collect_evidence(case.Case_ID, case.Order_ID, case.Product_Name)
+        print(f"[{case.Case_ID}]   go to orders  : {time.perf_counter() - t:.1f}s"); t = time.perf_counter()
+        agent.collect_evidence(case.Case_ID, case.Order_ID, case.Product_Name, order_url=case.Order_URL)
+        print(f"[{case.Case_ID}]   evidence      : {time.perf_counter() - t:.1f}s")
 
         pv = agent.details.get("product_verification", {})
         if pv.get("matched"):
@@ -249,7 +287,8 @@ def process_case(table_path: Path, idx: int, row: dict):
             payment_method=tm.get("payment_method", ""),
             replacement_initialization=tm.get("replacement_initialization", ""),
             replacement_date=tm.get("replacement_date", ""),
-            replacement_window=tm.get("replacement_window", "")
+            replacement_window=tm.get("replacement_window", ""),
+            order_source=agent.details.get("order_source", ""),
         )
         print(f"[{case.Case_ID}] {status}. Data & evidence collected successfully.")
     except BrowserAgentError as e:
@@ -259,16 +298,26 @@ def process_case(table_path: Path, idx: int, row: dict):
         error = f"Unexpected Error: {e}"
         traceback.print_exc()
     finally:
+        _f0 = time.perf_counter()
         try:
             write_case_files(case_dir, case, agent, started_at, status, error)
         except Exception as e:
             error += f" | metadata write failed: {e}"
+        _f1 = time.perf_counter()
         update_row(table_path, idx, processing_status=status, error_message=error)
+        _f2 = time.perf_counter()
         try:
             agent.close()
         except Exception:
             pass
-        print(f"[{case.Case_ID}] Product fetch took {time.perf_counter() - fetch_started:.1f} seconds.")
+        _f3 = time.perf_counter()
+        try:
+            agent.details.setdefault("timings_ms", {}).update({
+                "main_setup": setup_ms, "main_write_files": int((_f1 - _f0) * 1000),
+                "main_update_csv": int((_f2 - _f1) * 1000), "main_close": int((_f3 - _f2) * 1000)})
+        except Exception:
+            pass
+        _report(case.Case_ID, "Product", fetch_started, locals().get("agent"))
 
 
 # ------------------------------------------------------------------ ticketing
@@ -298,6 +347,7 @@ def process_ticket_case(table_path: Path, idx: int, row: dict):
     profile_dir = _profile_dir("ticket_", row, case.Platform_URL)
 
     started_at = utc_now()
+    setup_ms = int((time.perf_counter() - fetch_started) * 1000)
     status, error = "Failed", ""
     agent = None
     try:
@@ -307,9 +357,13 @@ def process_ticket_case(table_path: Path, idx: int, row: dict):
             headless=False,
             profile_dir=profile_dir
         )
+        t = time.perf_counter()
         agent.start()
+        print(f"[{case.Case_ID}]   browser start : {time.perf_counter() - t:.1f}s"); t = time.perf_counter()
         agent.login(case.Platform_URL, case.Username, case.Password)
+        print(f"[{case.Case_ID}]   login/session : {time.perf_counter() - t:.1f}s"); t = time.perf_counter()
         agent.collect_ticket_evidence(case.Case_ID, case.Ticket_ID, case.Subject)
+        print(f"[{case.Case_ID}]   evidence      : {time.perf_counter() - t:.1f}s")
 
         td = agent.details.get("ticket_details", {})
         sv = agent.details.get("subject_verification") or {}
@@ -337,17 +391,27 @@ def process_ticket_case(table_path: Path, idx: int, row: dict):
         error = f"Unexpected Error: {e}"
         traceback.print_exc()
     finally:
+        _f0 = time.perf_counter()
         try:
             write_case_files(case_dir, case, agent, started_at, status, error)
         except Exception as e:
             error += f" | metadata write failed: {e}"
+        _f1 = time.perf_counter()
         update_row(table_path, idx, "tickets", processing_status=status, error_message=error)
+        _f2 = time.perf_counter()
         try:
             if agent:
                 agent.close()
         except Exception:
             pass
-        print(f"[{case.Case_ID}] Ticket fetch took {time.perf_counter() - fetch_started:.1f} seconds.")
+        _f3 = time.perf_counter()
+        try:
+            agent.details.setdefault("timings_ms", {}).update({
+                "main_setup": setup_ms, "main_write_files": int((_f1 - _f0) * 1000),
+                "main_update_csv": int((_f2 - _f1) * 1000), "main_close": int((_f3 - _f2) * 1000)})
+        except Exception:
+            pass
+        _report(case.Case_ID, "Ticket", fetch_started, locals().get("agent"))
 
 
 def main():
@@ -355,7 +419,14 @@ def main():
     parser.add_argument("--file", help="Path to input file (.csv or .xlsx)")
     parser.add_argument("--type", choices=["orders", "tickets"],
                         help="Skip the menu: orders = e-commerce, tickets = ticketing")
+    parser.add_argument("--relearn", action="store_true",
+                        help="Ignore stored paths in config/learned_paths.json and learn them again")
+    parser.add_argument("--cdp-url", default=os.getenv("CHARGEBACKAI_CDP_URL", ""),
+                        help="Attach to an already-running Chrome (started with --remote-debugging-port) "
+                             "instead of launching one, e.g. http://localhost:9222")
     args = parser.parse_args()
+    path_learner.FORCE_RELEARN = args.relearn
+    browser_pool.configure(args.cdp_url)
 
     mode = args.type or choose_mode()
 
@@ -371,12 +442,15 @@ def main():
         print("No Pending cases found.")
         return
 
-    for idx, row in pending.iterrows():
-        print(f"\n--- Processing Case: {row.get('case id')} [{row.get('platform')}] ({mode}) ---")
-        if mode == "orders":
-            process_case(table_path, idx, row.to_dict())
-        else:
-            process_ticket_case(table_path, idx, row.to_dict())
+    try:
+        for idx, row in pending.iterrows():
+            print(f"\n--- Processing Case: {row.get('case id')} [{row.get('platform')}] ({mode}) ---")
+            if mode == "orders":
+                process_case(table_path, idx, row.to_dict())
+            else:
+                process_ticket_case(table_path, idx, row.to_dict())
+    finally:
+        browser_pool.shutdown()
 
 
 if __name__ == "__main__":

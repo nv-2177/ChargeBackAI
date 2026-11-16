@@ -63,23 +63,68 @@ def match_product(expected: str, candidates: list[str], threshold: float = 0.55)
     }
 
 
+_AMT = r"(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d{1,2})?)"
+# Priority order: the FIRST label that yields an amount wins (not the first one that appears on the page).
+_PRICE_LABELS = [r"Grand\s+Total", r"Order\s+Total", r"Total\s+Paid", r"Total\s+Amount",
+                 r"Amount\s+Paid", r"Final\s+Price"]
+_GENERIC_LABELS = [r"Price", r"Total"]
+_NOT_A_PRICE = re.compile(r"discount|saved|saving|refund|coupon|cashback|\bmrp\b|listing|shipping|delivery|"
+                          r"\bfees?\b|\btax|\bgst\b|\bemi\b|offer|reward|supercoin|sub\s*total|before", re.I)
+_NOT_A_PRICE_STRICT = re.compile(r"discount|saved|saving|refund", re.I)
+
+
+def _amount_after(lines: list, i: int, label: str):
+    """Amount on the same line after `label`, or alone on the next line when the label stands alone."""
+    m = re.search(rf"(?<![A-Za-z]){label}\b[^\d\n]{{0,25}}?{_AMT}", lines[i], re.I)
+    if m and re.search(rf"(?<![A-Za-z]){label}\b\s*[:\-]?\s*(?:\(.*?\))?\s*(?:₹|Rs\.?|INR)?\s*[\d,]", lines[i], re.I):
+        return m.group(1)
+    if re.fullmatch(rf"(?i)(?<![A-Za-z]){label}\b\s*(?:\(.*?\))?\s*[:\-]?", lines[i]) and i + 1 < len(lines):
+        m2 = re.match(rf"^\s*{_AMT}\s*$", lines[i + 1])
+        if m2:
+            return m2.group(1)
+    return None
+
+
+def extract_price(text: str) -> str:
+    """Amount actually paid. Priority labels first; generic 'Price'/'Total' only if none matched,
+    and never from discount / MRP / shipping / fee / tax / sub-total lines."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    def valid(v):
+        v = (v or "").replace(",", "")
+        try:
+            return v if float(v) > 0 else ""
+        except ValueError:
+            return ""
+
+    for label in _PRICE_LABELS:
+        for i, line in enumerate(lines):
+            if _NOT_A_PRICE_STRICT.search(line):
+                continue
+            v = valid(_amount_after(lines, i, label))
+            if v:
+                return v
+    for label in _GENERIC_LABELS:
+        for i, line in enumerate(lines):
+            if _NOT_A_PRICE.search(line):
+                continue
+            v = valid(_amount_after(lines, i, label))
+            if v:
+                return v
+    for line in lines:                                   # last resort: first rupee amount on a plain line
+        if _NOT_A_PRICE.search(line):
+            continue
+        m = re.search(r"₹\s*([\d,]+(?:\.\d{1,2})?)", line)
+        if m and valid(m.group(1)):
+            return valid(m.group(1))
+    return ""
+
+
 def extract_timeline_dates(text: str) -> dict:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     # 1. PRICE EXTRACTION
-    price = ""
-    amount = r"(?:₹|Rs\.?|INR|\$)?\s*([\d,]+(?:\.\d{1,2})?)"
-    price_patterns = [
-        rf"(?:Grand\s+Total|Order\s+Total|Total\s+Paid|Total\s+Amount|Amount\s+Paid|Final\s+Price|Price|Total)\s*[:\-]?\s*{amount}",
-        r"₹\s*([\d,]+(?:\.\d{1,2})?)",
-    ]
-    for pattern in price_patterns:
-        match = re.search(pattern, text, re.I)
-        if match and match.group(1):
-            val = match.group(1).replace(",", "")
-            if float(val) > 0:
-                price = val
-                break
+    price = extract_price(text)
 
     # 2. PINCODE EXTRACTION
     pincode = ""
@@ -174,13 +219,7 @@ def extract_timeline_dates(text: str) -> dict:
         "pincode": pincode,
         "payment_method": pay_method,
     }
-# ---------------------------------------------------------------------------
-# In agents/evidence_utils.py:
-#   1. DELETE the old "# Add to agents/evidence_utils.py" comment and the old
-#      extract_ticket_details() at the bottom of the file.
-#   2. PASTE everything below at the bottom. Nothing else in the file changes.
-# (re, datetime and timezone are already imported at the top of that file.)
-# ---------------------------------------------------------------------------
+
 
 def normalize_iso(value) -> str:
     """'2026-11-10T05:45:48.000Z' -> '2026-11-10T05:45:48+00:00' (same style as utc_now)."""
@@ -211,11 +250,7 @@ def extract_ticket_details(text: str, timestamps: list | None = None) -> dict:
     if m:
         priority = m.group(1)
 
-    parsed = []
-    for ts in timestamps or []:
-        iso = normalize_iso(ts)
-        if iso:
-            parsed.append(iso)
+    parsed = [iso for iso in (normalize_iso(ts) for ts in (timestamps or [])) if iso]
     created_date = min(parsed) if parsed else ""
 
     return {

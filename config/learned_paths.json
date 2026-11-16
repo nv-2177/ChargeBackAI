@@ -1,0 +1,107 @@
+{
+  "schema": 1,
+  "paths": {
+    "zendesk|chennaiinstituteoftechnology-23395.zendesk.com|tickets": {
+      "schema": 1,
+      "platform": "zendesk",
+      "host": "chennaiinstituteoftechnology-23395.zendesk.com",
+      "flow": "tickets",
+      "learned_at_utc": "2026-11-11T05:28:41+00:00",
+      "last_used_utc": "2026-11-16T07:26:48+00:00",
+      "runs_ok": 11,
+      "discovered_via": "config_hint",
+      "start_url": "{origin}/",
+      "login_steps": null,
+      "fetch_steps": [
+        {
+          "name": "open_hint_url",
+          "action": "goto",
+          "url": "/agent/tickets/{ticket_id}",
+          "instruction": "Go to /agent/tickets/{ticket_id}"
+        }
+      ],
+      "fast_path": "{origin}/agent/tickets/{ticket_id}",
+      "path_summary": [
+        "== FETCH ==",
+        "1. Go to /agent/tickets/{ticket_id}",
+        "FAST PATH (tried first): go to {origin}/agent/tickets/{ticket_id}"
+      ]
+    },
+    "amazon|www.amazon.in|orders": {
+      "schema": 1,
+      "platform": "amazon",
+      "host": "www.amazon.in",
+      "flow": "orders",
+      "learned_at_utc": "2026-11-11T05:37:14+00:00",
+      "last_used_utc": "2026-11-16T07:24:55+00:00",
+      "runs_ok": 20,
+      "discovered_via": "config_hint",
+      "start_url": "{origin}",
+      "login_steps": null,
+      "fetch_steps": [
+        {
+          "name": "open_hint_url",
+          "action": "goto",
+          "url": "/your-orders/order-details?orderID={order_id}",
+          "instruction": "Go to /your-orders/order-details?orderID={order_id}"
+        }
+      ],
+      "fast_path": "{origin}/your-orders/order-details?orderID={order_id}",
+      "path_summary": [
+        "== FETCH ==",
+        "1. Go to /your-orders/order-details?orderID={order_id}",
+        "FAST PATH (tried first): go to {origin}/your-orders/order-details?orderID={order_id}"
+      ]
+    },
+    "flipkart|www.flipkart.com|orders": {
+      "schema": 1,
+      "platform": "flipkart",
+      "host": "www.flipkart.com",
+      "flow": "orders",
+      "learned_at_utc": "2026-11-11T05:38:01+00:00",
+      "last_used_utc": "2026-11-11T06:21:41+00:00",
+      "runs_ok": 5,
+      "discovered_via": "config_hint",
+      "start_url": "{origin}",
+      "login_steps": null,
+      "fetch_steps": [
+        {
+          "name": "open_hint_url",
+          "action": "goto",
+          "url": "/account/orders?order_id={order_id}",
+          "instruction": "Go to /account/orders?order_id={order_id}"
+        },
+        {
+          "name": "search_for_target",
+          "action": "fill",
+          "selector": "input[placeholder=\"Search your orders here\"]",
+          "intent": "search",
+          "value_from": "order_id",
+          "matched_by": "placeholder/name mentions 'order' + search",
+          "selector_verified": true,
+          "instruction": "Fill `input[placeholder=\"Search your orders here\"]` with the order_id (matched by placeholder/name mentions 'order' + search)"
+        },
+        {
+          "name": "submit_search",
+          "action": "click",
+          "selector": "button:has-text(\"Search Orders\")",
+          "intent": "search_btn",
+          "matched_keyword": "search orders",
+          "element_text": "Search Orders",
+          "selector_verified": true,
+          "expect_url_contains": "/account/orders/search",
+          "optional": true,
+          "instruction": "Click the element matching `button:has-text(\"Search Orders\")` (found via keyword 'search orders', text 'Search Orders'); expect URL to contain '/account/orders/search'"
+        }
+      ],
+      "fast_path": "{origin}/account/orders/search?sq={order_id}",
+      "path_summary": [
+        "== FETCH ==",
+        "1. Go to /account/orders?order_id={order_id}",
+        "2. Fill `input[placeholder=\"Search your orders here\"]` with the order_id (matched by placeholder/name mentions 'order' + search)",
+        "3. Click the element matching `button:has-text(\"Search Orders\")` (found via keyword 'search orders', text 'Search Orders'); expect URL to contain '/account/orders/search'",
+        "FAST PATH (tried first): go to {origin}/account/orders/search?sq={order_id}"
+      ]
+    }
+  }
+}
