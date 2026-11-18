@@ -41,7 +41,7 @@ _READY_JS = r"""
 
 
 def wait_page_ready(page, any_of_texts=None, any_of_selectors=None, timeout_ms: int = 3_000,
-                    stable_polls: int = 2, poll_ms: int = 80) -> bool:
+                    stable_polls: int = 2, poll_ms: int = 50) -> bool:
     """
     True as soon as the page content is really there and has stopped changing:
       - at least one expected text / selector is present (if any were given), and
@@ -64,7 +64,10 @@ def wait_page_ready(page, any_of_texts=None, any_of_selectors=None, timeout_ms: 
             has = bool(st["any"]) and st["len"] > 0
             stable = (stable + 1 if st["len"] == last_len else 1) if has else 0
             last_len = st["len"]
-            if has and stable >= stable_polls + (3 if st["busy"] else 0):
+            # A spinner/skeleton normally costs +3 polls; if a specifically expected text is already on the page
+            # (an order id, a ticket id) it only costs +1, because many apps keep a permanent loader element.
+            extra = (1 if texts and st["any"] else 3) if st["busy"] else 0
+            if has and stable >= stable_polls + extra:
                 return True
         if time.perf_counter() >= deadline:
             return False

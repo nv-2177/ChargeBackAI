@@ -33,6 +33,7 @@ PLATFORM_CONFIGS = {
         "search_input": ["#searchOrdersInput", "#yourOrdersInput", "input[name='search']"],
         "search_btn": ["input[name='submit.search']", "button:has-text('Search Orders')", "input[aria-label*='Search Orders' i]"],
         "card_from_link": True,
+        "fast_http_order": True,      # order page is server-rendered: read it over authenticated HTTP, no page load
         "order_id_regex": r"\d{3}-\d{7}-\d{7}",
         "order_card": ["div.a-section.a-spacing-none.a-padding-small", "div.order-card", "div.js-order-card", "div.a-box-group.order"],
         "product_link_css": "a[href*='/dp/'], a[href*='/gp/product/']",
@@ -120,12 +121,12 @@ PLATFORM_CONFIGS = {
         "direct_ticket_url": "/agent/tickets/{ticket_id}",
         # Session-cookie JSON endpoints (same login as the browser):
         "api_me_url": "/api/v2/users/me.json",
-        "api_ticket_url": "/api/v2/tickets/{ticket_id}.json?include=metric_sets",
-        "api_comments_url": "/api/v2/tickets/{ticket_id}/comments.json",
+        "api_ticket_url": "/api/v2/tickets/{ticket_id}.json?include=metric_sets,users",
+        "api_comments_url": "/api/v2/tickets/{ticket_id}/comments.json?include=users",
         # Only used if the account that signs in turns out to be an end-user (not an agent):
         "direct_ticket_url_enduser": "/hc/en-us/requests/{ticket_id}",
         "api_ticket_url_enduser": "/api/v2/requests/{ticket_id}.json",
-        "api_comments_url_enduser": "/api/v2/requests/{ticket_id}/comments.json",
+        "api_comments_url_enduser": "/api/v2/requests/{ticket_id}/comments.json?include=users",
 
         "attachment_href_regex": r"/attachments/|/attachments/token/",
     },
@@ -146,9 +147,9 @@ PLATFORM_CONFIGS = {
         "tickets_url": "/jira/your-work",
         "reauth_markers": ["/auth/v2/login", "/login", "id.atlassian.com"],
         "direct_ticket_url": "/browse/{ticket_id}",
-        "api_me_url": "/rest/api/3/myself",
-        "api_ticket_url": "/rest/api/3/issue/{ticket_id}",
-        "api_comments_url": "/rest/api/3/issue/{ticket_id}/comment?maxResults=100",
+        "api_me_url": "/rest/api/2/myself",
+        "api_ticket_url": "/rest/api/2/issue/{ticket_id}",
+        "api_comments_url": "/rest/api/2/issue/{ticket_id}/comment?maxResults=100",
         "attachment_href_regex": r"/secure/attachment/|/rest/api/\d+/attachment/content/",
     },
 

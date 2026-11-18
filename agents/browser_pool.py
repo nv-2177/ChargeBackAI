@@ -2,7 +2,7 @@
 agents/browser_pool.py
 
 One Playwright driver and one browser context per profile, kept alive for the WHOLE run.
-- The first case pays the browser launch once.
+- Pending profiles are prewarmed before case processing, moving browser launch time out of case timings.
 - Every later case reuses the running browser (a new tab opens in milliseconds).
 - With a CDP URL (python main.py --cdp-url http://localhost:9222) the agent attaches to a Chrome that is
   already running, so even the first case has no launch cost.
@@ -120,13 +120,13 @@ class BrowserPool:
         """Hand a tab back. The last tab is never closed (that could close the browser)."""
         self._claimed.discard(id(pg))
         try:
-            pg.unroute("**/*")
-        except Exception:
-            pass
-        try:
             if len([p for p in ctx.pages if not p.is_closed()]) > 1:
-                pg.close()
+                pg.close()                      # routes die with the tab: no unroute round trip
             else:
+                try:
+                    pg.unroute_all(behavior="ignoreErrors")
+                except Exception:
+                    pass
                 pg.goto("about:blank")
         except Exception:
             pass

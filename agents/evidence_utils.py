@@ -174,11 +174,13 @@ def extract_timeline_dates(text: str) -> dict:
     _MONTH = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
     _DATE_SRC = r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+" + _MONTH + r"\.?,?(?:\s+\d{4})?|" + _MONTH + r"\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b"
     
-    def find_date(patterns):
+    def find_date(patterns, back: int = 1):
+        # back=0 for status lines like "Replacement delivered": the date AFTER the label belongs to it, and the
+        # line before is usually the previous milestone's date.
         for pat in patterns:
             for i, line in enumerate(lines):
                 if re.search(pat, line, re.I):
-                    context = " ".join(lines[max(0, i-1):min(len(lines), i+5)])
+                    context = " ".join(lines[max(0, i-back):min(len(lines), i+5)])
                     m = re.search(_DATE_SRC, context, re.I)
                     if m:
                         return m.group()
@@ -209,11 +211,11 @@ def extract_timeline_dates(text: str) -> dict:
         "replacement_initialization": find_date([
             r"replacement\s+(?:requested|initiated|approved|ordered)",
             r"return\s+(?:requested|initiated|approved)"
-        ]),
+        ], back=0),
         "replacement_date": find_date([
             r"replacement\s+(?:delivered|completed|shipped)",
             r"replacement\s+item\s+delivered"
-        ]),
+        ], back=0),
         "replacement_window": window_match.group(1) if window_match else "",
         "price": price,
         "pincode": pincode,

@@ -1,4 +1,7 @@
+import base64
+import html as _html
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -19,6 +22,54 @@ log = logging.getLogger("chargebackai")
 
 class BrowserAgentError(Exception):
     pass
+
+
+_BLOCK_RE = re.compile(
+    r"(\.(?:png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|m4s|mp3)(?:[?#].*)?$)"
+    r"|(?:analytics|telemetry|doubleclick|googletagmanager|google-analytics|googlesyndication|amazon-adsystem|"
+    r"adsystem|clevertap|moengage|hotjar|gravatar|xp\.atlassian|facebook\.net|connect\.facebook|segment\.io|mixpanel|sentry\.io|"
+    r"newrelic|nr-data|/beacon|/pixel|/metrics|fls-eu|fls-na|unagi)", re.I)
+
+_RETURN_LINK_JS = r"""
+() => {
+  const re = /(return|refund|replacement)[\w\s\/]{0,20}status|track\s+(return|replacement|refund)/i;
+  for (const e of document.querySelectorAll('a, button, [role="link"], [role="button"]')) {
+    const t = (e.innerText || e.getAttribute('aria-label') || '').trim();
+    if (!t || t.length > 80 || !re.test(t)) continue;
+    const r = e.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    e.setAttribute('data-cb-return', '1');
+    return {href: e.href || '', text: t};
+  }
+  return null;
+}
+"""
+
+def _html_to_text(h: str) -> str:
+    """HTML -> line-per-block plain text (good enough for the date regexes)."""
+    h = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", h)
+    h = re.sub(r"(?i)<br\s*/?>|</(?:div|p|li|tr|h\d|td|section)>", "\n", h)
+    h = _html.unescape(re.sub(r"<[^>]+>", " ", h))
+    lines = (re.sub(r"[ \t\xa0]+", " ", ln).strip() for ln in h.splitlines())
+    return "\n".join(ln for ln in lines if ln)
+
+
+_FETCH_MANY_JS = r"""
+async (urls) => Promise.all(urls.map(async u => {
+  try {
+    const r = await fetch(u, {credentials: 'include'});
+    if (!r.ok) return {u, ok: false};
+    const ct = r.headers.get('content-type') || '';
+    const buf = new Uint8Array(await r.arrayBuffer());
+    let s = ''; for (let i = 0; i < buf.length; i += 32768) s += String.fromCharCode.apply(null, buf.subarray(i, i + 32768));
+    return {u, ok: true, ct, b64: btoa(s)};
+  } catch (e) { return {u, ok: false}; }
+}))
+"""
+
+
+_RETURN_TEXT_RE = re.compile(r"(return|refund|replacement)[\w\s/]{0,20}status|track\s+(return|replacement|refund)", re.I)
+_ANCHOR_RE = re.compile(r"(?is)<a\b[^>]*?href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>")
 
 
 class PlatformBrowserAgent:
@@ -49,15 +100,9 @@ class PlatformBrowserAgent:
         self.page = self.pool.page(self.context)                           # new tab: milliseconds
 
         # SPEED OPTIMIZATION: block heavy assets (images, media, fonts, tracking)
-        def _block_resources(route):
-            if route.request.resource_type in ["image", "media", "font"]:
-                route.abort()
-            elif any(track in route.request.url for track in ["analytics", "telemetry", "doubleclick"]):
-                route.abort()
-            else:
-                route.continue_()
-
-        self.page.route("**/*", _block_resources)
+        # Only requests that MATCH this pattern reach Python (and get aborted); everything else goes straight to the
+        # network. The old catch-all "**/*" handler made a Python round trip for every one of hundreds of requests.
+        self.page.route(_BLOCK_RE, lambda route: route.abort())
         self.details.setdefault("timings_ms", {})["browser_start"] = int((time.perf_counter() - t0) * 1000)
 
     def _ensure_page(self):
@@ -446,33 +491,48 @@ class PlatformBrowserAgent:
                 "a[href]", "els => els.map(e => ({href: e.href, text: (e.innerText || '').trim()}))")
         except Exception:
             links = []
-        seen: set = set()
+        cands: list = []
         for link in links:
             href = link["href"]
-            if href in seen or not href.startswith("http") or not re.search(pattern, href, re.I):
-                continue
-            seen.add(href)
-            if len(seen) > 3:
-                break
-            try:
-                resp = self.context.request.get(href, timeout=6_000)
-                if not resp.ok:
-                    continue
-                ctype = (resp.headers.get("content-type") or "").lower()
-                body = resp.body()
-                if "pdf" in ctype:
-                    ext = ".pdf"
-                elif "html" in ctype and oid in body.decode("utf-8", "ignore").lower():
-                    ext = ".html"          # e.g. a printable order summary that carries this order id
-                else:
-                    continue
-                name = f"invoice_{order_id}{'' if not found else '_' + str(len(found) + 1)}{ext}"
-                (docs / name).write_bytes(body)
-                found.append({"file": name, "source_url": href, "type": "direct_fetch", "content_type": ctype})
-                if ext == ".pdf":
-                    return found
+            if href.startswith("http") and href not in cands and re.search(pattern, href, re.I):
+                cands.append(href)
+        cands = cands[:3]
+
+        def _accept(href, ctype, body):
+            ctype = (ctype or "").lower()
+            if "pdf" in ctype:
+                ext = ".pdf"
+            elif "html" in ctype and oid in body.decode("utf-8", "ignore").lower():
+                ext = ".html"          # e.g. a printable order summary that carries this order id
+            else:
+                return None
+            name = f"invoice_{order_id}{'' if not found else '_' + str(len(found) + 1)}{ext}"
+            (docs / name).write_bytes(body)
+            found.append({"file": name, "source_url": href, "type": "direct_fetch", "content_type": ctype})
+            return ext
+
+        if cands:
+            results, failed = [], list(cands)
+            try:       # all candidates in parallel inside the page (same session cookies), one round trip
+                results = self.page.evaluate(_FETCH_MANY_JS, cands)
+                failed = [r["u"] for r in results if not r.get("ok")]
             except Exception:
-                continue
+                results = []
+            ok = [r for r in results if r.get("ok")]
+            ok.sort(key=lambda r: "pdf" not in (r.get("ct") or "").lower())      # PDFs first
+            for r in ok:
+                try:
+                    if _accept(r["u"], r.get("ct"), base64.b64decode(r["b64"])) == ".pdf":
+                        return found
+                except Exception:
+                    continue
+            for href in failed:      # e.g. cross-origin (CORS) links: use the browser context's own request client
+                try:
+                    resp = self.context.request.get(href, timeout=4_000)
+                    if resp.ok and _accept(href, resp.headers.get("content-type"), resp.body()) == ".pdf":
+                        return found
+                except Exception:
+                    continue
         if found:
             return found
 
@@ -490,7 +550,7 @@ class PlatformBrowserAgent:
                 pass
 
         # 3) Page-as-PDF only works in headless Chromium
-        if self.headless:
+        if self.headless and os.environ.get("CB_PAGE_PDF", "1") != "0":     # CB_PAGE_PDF=0 skips this slow fallback
             out = docs / f"order_details_{order_id}.pdf"
             try:
                 self.page.pdf(path=str(out), format="A4", print_background=True)
@@ -498,6 +558,143 @@ class PlatformBrowserAgent:
             except Exception:
                 pass
         return found
+
+    # ------------------------------------------------------------ HTTP-first evidence (no order-page load)
+    def _fast_http_eligible(self) -> bool:
+        c = self.config
+        return bool(c.get("fast_http_order") and c.get("direct_details_url")
+                    and str(self.platform_url).startswith("http") and os.environ.get("CB_ORDER_LIVE", "0") != "1")
+
+    def _http_page(self, url: str, timeout: int = 6_000) -> str:
+        """Body of an authenticated GET, or '' when it is not usable (error, sign-in redirect, captcha)."""
+        try:
+            resp = self.context.request.get(url, timeout=timeout)
+        except Exception as e:
+            log.debug(f"HTTP GET failed {url}: {e}")
+            return ""
+        if not resp.ok or any(m in (resp.url or url) for m in (self.config.get("reauth_markers") or [])):
+            return ""
+        body = resp.text()
+        if re.search(r"validateCaptcha|Enter the characters you see", body, re.I):
+            return ""
+        return body
+
+    def _render_order_summary(self, d: dict, text: str) -> str:
+        e = _html.escape
+        tl = d.get("timeline") or {}
+        pv = d.get("product_verification") or {}
+        rows = [("Order ID", d.get("order_id")), ("Expected product", d.get("product_name_expected")),
+                ("Matched on page", f"{pv.get('matched')} (score {pv.get('score')})"),
+                ("Order date", tl.get("order_date")), ("Price paid", tl.get("price")),
+                ("Payment method", tl.get("payment_method")), ("Delivery pincode", tl.get("pincode")),
+                ("Replacement requested", tl.get("replacement_initialization")),
+                ("Replacement delivered", tl.get("replacement_date")), ("Return window", tl.get("replacement_window"))]
+        trs = "".join(f"<tr><th>{e(k)}</th><td>{e(str(v or '-'))}</td></tr>" for k, v in rows)
+        inv = "".join(f"<div>invoice: {e(i['file'])}</div>" for i in d.get("invoices") or []) or "<div>invoice: none found</div>"
+        return f"""<!doctype html><html><head><meta charset="utf-8"><title>Order {e(str(d.get('order_id')))}</title>
+<style>body{{font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif;margin:18px;color:#1f2933}}
+.banner{{background:#fff8e1;border:1px solid #f0c36d;padding:8px 10px;border-radius:6px;font-size:12px;margin-bottom:12px}}
+h1{{font-size:18px;margin:0 0 8px}}th{{text-align:left;padding:2px 14px 2px 0;color:#52606d;font-weight:600}}td{{padding:2px 0}}
+pre{{white-space:pre-wrap;font:12px/1.4 ui-monospace,Consolas,monospace;background:#f5f7fa;padding:8px;border-radius:6px;max-height:260px;overflow:hidden}}</style></head><body>
+<div class="banner"><b>Evidence summary built from the order page as served by {e(self.platform.title())}</b> (authenticated HTTP request at
+{e(d['collected_at_utc'])}) &mdash; not a screenshot of the live page. The page source exactly as received is saved in
+documents/dom_order_details.html (SHA-256 in metadata.json).</div>
+<h1>Order {e(str(d.get('order_id')))}</h1><table>{trs}</table>{inv}
+<div style="margin-top:10px"><b>Page text (excerpt)</b></div><pre>{e(text[:2500])}</pre></body></html>"""
+
+    def _collect_via_http(self, order_id: str, product_name: str, tm, d: dict) -> bool:
+        """True when the evidence was built entirely over HTTP. False (nothing half-done) -> use the live page."""
+        docs = self.evidence_dir / "documents"
+        url = resolve_platform_url(self.config, "direct_details_url", self.platform_url, order_id=order_id)
+        with tm.phase("http_order"):
+            body = self._http_page(url)
+            if not body:
+                return False
+            text = _html_to_text(body)
+            if order_id not in text and order_id not in body:
+                return False
+            timeline = extract_timeline_dates(text)
+            printed = ""
+            need = [k for k in ("order_date", "price", "payment_method", "pincode") if not timeline.get(k)]
+            if need and self.config.get("print_summary_url"):
+                # the printable order summary carries payment / address / totals as plain server-rendered HTML
+                purl = resolve_platform_url(self.config, "print_summary_url", self.platform_url, order_id=order_id)
+                pbody = self._http_page(purl)
+                if pbody and order_id in pbody:
+                    printed = pbody
+                    for k, v in extract_timeline_dates(_html_to_text(pbody)).items():
+                        if k in need and v:
+                            timeline[k] = v
+            if not (timeline.get("price") and timeline.get("order_date")):
+                return False                       # incomplete: never ship half a record, use the live page instead
+            (docs / "dom_order_details.html").write_text(body, encoding="utf-8")
+            if printed:
+                (docs / "order_summary_print.html").write_text(printed, encoding="utf-8")
+            d["order_details_text"] = text
+            d["timeline"] = timeline
+            d["product_verification"] = match_product(product_name, [text])
+            d["pages"]["order_details"] = d["order_details_url_full"] = url
+
+        with tm.phase("return_status"):
+            raw = _html.unescape(body)
+            rhref = ""
+            for href, inner in _ANCHOR_RE.findall(raw):
+                if _RETURN_TEXT_RE.search(re.sub(r"<[^>]+>", " ", inner)) and len(inner) < 400:
+                    rhref = href
+                    break
+            if rhref and not (timeline.get("replacement_initialization") and timeline.get("replacement_date")):
+                rurl = urljoin(url, rhref)
+                rbody = self._http_page(rurl, 3_000)
+                if rbody:
+                    (docs / "dom_return_details.html").write_text(rbody, encoding="utf-8")
+                    rtext = _html_to_text(rbody)
+                    if re.search(r"return|replacement|refund", rtext, re.I):
+                        for k, v in extract_timeline_dates(rtext).items():
+                            if k in ("replacement_initialization", "replacement_date", "replacement_window") and v:
+                                timeline[k] = v
+                        d["pages"]["return_status"] = rurl
+
+        with tm.phase("invoices"):
+            pattern = self.config.get("invoice_href_regex") or r"invoice"
+            cands = []
+            for href, _inner in _ANCHOR_RE.findall(raw):
+                if re.search(pattern, href, re.I):
+                    cands.append(urljoin(url, href))
+            cands += [urljoin(url, m) for m in re.findall(r"/documents/download/[^\"'\s<>\\]+", raw)]
+            seen, found = set(), []
+            for href in [c for c in cands if not (c in seen or seen.add(c))][:3]:
+                try:
+                    r = self.context.request.get(href, timeout=4_000)
+                    ct = (r.headers.get("content-type") or "").lower()
+                    if not r.ok:
+                        continue
+                    data = r.body()
+                except Exception:
+                    continue
+                if "pdf" in ct:
+                    ext = ".pdf"
+                elif "html" in ct and order_id.lower() in data.decode("utf-8", "ignore").lower():
+                    ext = ".html"
+                else:
+                    continue
+                name = f"invoice_{order_id}{'' if not found else '_' + str(len(found) + 1)}{ext}"
+                (docs / name).write_bytes(data)
+                found.append({"file": name, "source_url": href, "type": "direct_fetch", "content_type": ct})
+                if ext == ".pdf":
+                    break
+            d["invoices"] = found
+
+        d["order_source"] = "http_fast"
+        d["evidence_mode"] = "http_summary"
+        with tm.phase("evidence_files"):
+            summary = self._render_order_summary(d, text)
+            (docs / "order_summary.html").write_text(summary, encoding="utf-8")
+            self._ensure_page()
+            self.page.set_content(summary, wait_until="domcontentloaded")
+            self.page.screenshot(path=str(self.evidence_dir / "screenshots" / "order_summary_page.jpg"),
+                                 type="jpeg", quality=65, full_page=False)
+        d["page_ready"] = True
+        return True
 
     def collect_evidence(self, case_id: str, order_id: str, product_name: str, order_url: str = "") -> dict:
         d = self.details
@@ -511,6 +708,20 @@ class PlatformBrowserAgent:
             "invoices": [],
             "collected_at_utc": utc_now(),
         })
+
+        # FAST PATH: the saved session already authenticates plain HTTP requests; no page needs to be opened.
+        if self._fast_http_eligible():
+            try:
+                if self._collect_via_http(order_id, product_name, tm, d):
+                    d.setdefault("timings_ms", {}).update(tm.marks)
+                    d["timings_ms"]["collect_total"] = tm.total_ms()
+                    return d
+            except Exception as e:
+                log.warning(f"[{self.platform}] HTTP-first evidence failed ({e}); using the live page.")
+            else:
+                log.info(f"[{self.platform}] HTTP-first not usable (not signed in / page incomplete); using the live page.")
+            d.update({"pages": {}, "invoices": []})
+        d["evidence_mode"] = "live_page"
 
         with tm.phase("open_order"):
             d["order_source"] = self._open_order(order_id, order_url)
@@ -553,7 +764,7 @@ class PlatformBrowserAgent:
         with tm.phase("evidence_files"):
             self.page.screenshot(
                 path=str(self.evidence_dir / "screenshots" / "order_details_page.png"),
-                type="jpeg", quality=50, scale="css")
+                type="jpeg", quality=60, scale="css")
             (self.evidence_dir / "documents" / "dom_order_details.html").write_text(
                 self.page.content(), encoding="utf-8")
 
@@ -562,15 +773,41 @@ class PlatformBrowserAgent:
 
         # Return / Replacement Status Navigation
         with tm.phase("return_status"):
-            ret_btn = self._first_visible([
-                "a:has-text('View Return/Refund Status')", "a:has-text('Return Status')",
-                "a:has-text('Refund Status')", "a:has-text('Replacement Status')",
-                "text=/Return Status/i", "text=/Refund Status/i", "text=/Replacement Status/i",
-            ])
-            if ret_btn:
+            try:
+                ret = self.page.evaluate(_RETURN_LINK_JS)           # one call; None when the order has no return link
+            except Exception:
+                ret = None
+            tl = d.get("timeline") or {}
+            if ret and tl.get("replacement_initialization") and tl.get("replacement_date"):
+                d["return_status_skipped"] = "dates already on the order page"
+                ret = None
+            if ret and os.environ.get("CB_FAST_RETURN", "1") != "0" and (ret.get("href") or "").startswith("http"):
+                # No navigation: authenticated GET with the browser's own cookies (~150-300 ms instead of ~2-3 s).
+                # The raw HTML is kept as the evidence copy; dates come from its text. CB_FAST_RETURN=0 = old page visit.
                 try:
-                    ret_btn.click()
-                    wait_page_ready(self.page, timeout_ms=1_500)
+                    rurl = urljoin(self.page.url, ret["href"])
+                    resp = self.context.request.get(rurl, timeout=3_000)
+                    if resp.ok:
+                        body = resp.text()
+                        (self.evidence_dir / "documents" / "dom_return_details.html").write_text(body, encoding="utf-8")
+                        rtext = _html_to_text(body)
+                        if re.search(r"return|replacement|refund", rtext, re.I):     # a real status page, not a login/error page
+                            for k, v in extract_timeline_dates(rtext).items():
+                                if k in ("replacement_initialization", "replacement_date", "replacement_window") and v:
+                                    d["timeline"][k] = v
+                            d["pages"]["return_status"] = rurl
+                            d["return_status_mode"] = "http_get (HTML saved, no screenshot)"
+                            ret = None
+                except Exception as e:
+                    log.warning(f"Return-status GET failed, opening the page instead: {e}")
+            if ret:
+                try:
+                    href = ret.get("href") or ""
+                    if href.startswith("http"):
+                        self.page.goto(href, wait_until="domcontentloaded")
+                    else:
+                        self.page.click('[data-cb-return="1"]')
+                    wait_page_ready(self.page, any_of_texts=["return", "refund", "replacement"], timeout_ms=1_500)
                     d["pages"]["return_status"] = self.page.url
                     ret_text = self.page.locator("body").inner_text()
                     ret_timeline = extract_timeline_dates(ret_text)
@@ -579,7 +816,7 @@ class PlatformBrowserAgent:
                             d["timeline"][k] = ret_timeline[k]
                     self.page.screenshot(
                         path=str(self.evidence_dir / "screenshots" / "return_status_page.png"),
-                        type="jpeg", quality=50, scale="css")
+                        type="jpeg", quality=60, scale="css")
                 except Exception as e:
                     log.warning(f"Return status navigation failed: {e}")
 

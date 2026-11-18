@@ -1,5 +1,9 @@
 import argparse
+import copy
 import hashlib
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 import os
 import sys
 import time
@@ -206,6 +210,44 @@ def _profile_dir(prefix: str, row: dict, platform_url: str = "") -> Path:
     return d
 
 
+def _prewarm_browsers(pending: pd.DataFrame, mode: str):
+    seen = set()
+    pool = browser_pool.get_pool()
+    started = time.perf_counter()
+    for _, row in pending.iterrows():
+        row = row.to_dict()
+        profile_dir = _profile_dir(
+            "ticket_" if mode == "tickets" else "",
+            row,
+            row.get("platform_url", "") if mode == "tickets" else "",
+        )
+        key = "cdp" if pool.cdp_url else str(profile_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            pool.context(profile_dir, headless=False)
+            print(f"[{row.get('case id')}] Browser prewarmed.")
+        except Exception as e:
+            print(f"[{row.get('case id')}] Browser prewarm failed; will retry during processing: {e}")
+    print(f"Browser prewarm took {time.perf_counter() - started:.1f}s.")
+
+
+_BG = ThreadPoolExecutor(max_workers=1)     # metadata.json + file hashing run here, not on the per-case clock
+
+
+def _meta_later(case_dir, case, agent, started_at, status, error):
+    """Snapshot the details now, write metadata.json (incl. sha256 of every evidence file) in the background."""
+    snap = SimpleNamespace(details=copy.deepcopy(agent.details)) if agent else None
+
+    def _job():
+        try:
+            write_case_files(case_dir, case, snap, started_at, status, error)
+        except Exception as e:
+            logging.getLogger("chargebackai").error(f"[{case.Case_ID}] metadata write failed: {e}")
+    _BG.submit(_job)
+
+
 # ------------------------------------------------------------------ e-commerce (unchanged logic)
 def _report(case_id, label, started, agent=None):
     elapsed = time.perf_counter() - started
@@ -300,7 +342,7 @@ def process_case(table_path: Path, idx: int, row: dict):
     finally:
         _f0 = time.perf_counter()
         try:
-            write_case_files(case_dir, case, agent, started_at, status, error)
+            _meta_later(case_dir, case, agent, started_at, status, error)
         except Exception as e:
             error += f" | metadata write failed: {e}"
         _f1 = time.perf_counter()
@@ -393,7 +435,7 @@ def process_ticket_case(table_path: Path, idx: int, row: dict):
     finally:
         _f0 = time.perf_counter()
         try:
-            write_case_files(case_dir, case, agent, started_at, status, error)
+            _meta_later(case_dir, case, agent, started_at, status, error)
         except Exception as e:
             error += f" | metadata write failed: {e}"
         _f1 = time.perf_counter()
@@ -443,6 +485,7 @@ def main():
         return
 
     try:
+        _prewarm_browsers(pending, mode)
         for idx, row in pending.iterrows():
             print(f"\n--- Processing Case: {row.get('case id')} [{row.get('platform')}] ({mode}) ---")
             if mode == "orders":
@@ -450,6 +493,7 @@ def main():
             else:
                 process_ticket_case(table_path, idx, row.to_dict())
     finally:
+        _BG.shutdown(wait=True)           # let every metadata.json finish before the browser/process ends
         browser_pool.shutdown()
 
 

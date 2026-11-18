@@ -1,5 +1,7 @@
 # agents/ticket_agent.py
 import logging
+import html as _html
+import os
 import re
 import time
 from collections import Counter
@@ -34,6 +36,15 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^\w.\- ]+", "_", str(name or "file")).strip() or "file"
 
 
+# Telemetry / error trackers / avatars only. NEVER block the app's own asset hosts (zdassets.com, atl-paas.net,
+# atlassian.com static, freshdesk assets): that is the UI's code and the ticket would not render.
+_TICKET_BLOCK_RE = re.compile(
+    r"(\.(?:woff2?|ttf|otf|eot|mp4|webm|m4s|mp3)(?:[?#].*)?$)"
+    r"|(?:sentry\.io|pubsub-shard|sentry-cdn|bugsnag|rollbar|datadoghq|browser-intake|segment\.(?:io|com)|fullstory|hotjar|"
+    r"google-analytics|googletagmanager|doubleclick|amplitude\.com|mixpanel|pendo\.io|optimizely|newrelic|nr-data|"
+    r"gravatar\.com|logrocket|heap(?:analytics)?\.|/analytics/|/telemetry|/beacon|as\.atlassian\.com|xp\.atlassian\.com)", re.I)
+
+
 class TicketBrowserAgent:
     def __init__(self, platform_name: str, evidence_dir: Path, headless: bool = True, profile_dir: Path | None = None):
         self.platform = str(platform_name).strip().lower()
@@ -50,6 +61,7 @@ class TicketBrowserAgent:
                 "in config/platforms.py (use the e-commerce mode for it)"
             )
         self._extra_attachments: list = []
+        self._users: dict = {}
         self.evidence_dir = Path(evidence_dir)
         (self.evidence_dir / "screenshots").mkdir(parents=True, exist_ok=True)
         (self.evidence_dir / "documents").mkdir(parents=True, exist_ok=True)
@@ -108,7 +120,10 @@ class TicketBrowserAgent:
                     return
             route.continue_()
 
-        self.page.route("**/*", _block)
+        if block_3p:
+            self.page.route("**/*", _block)          # needs to inspect every request
+        else:                                        # only media/fonts are blocked: skip the Python round trip for the rest
+            self.page.route(_TICKET_BLOCK_RE, lambda route: route.abort())
         self._filters_on = True
 
     def _remove_filters(self):
@@ -213,6 +228,9 @@ class TicketBrowserAgent:
             if data is None:
                 return items if pages else None
             items.extend(data.get(key, []))
+            for u in data.get("users") or []:          # side-loaded users (?include=users): id -> name
+                if isinstance(u, dict) and u.get("id") is not None:
+                    self._users[u["id"]] = u.get("name") or u.get("email") or ""
             url = data.get("next_page") or ""
             pages += 1
         return items
@@ -281,7 +299,7 @@ class TicketBrowserAgent:
         except Exception as e:
             return False, str(e)
 
-    def _download_attachments(self, comments: list | None) -> list[dict]:
+    def _download_attachments(self, comments: list | None, api_complete: bool = False, dom_scan: bool = True) -> list[dict]:
         out_dir = self.evidence_dir / "documents" / "attachments"
         out_dir.mkdir(parents=True, exist_ok=True)
         records: list[dict] = []
@@ -310,6 +328,10 @@ class TicketBrowserAgent:
         for a in self._extra_attachments:
             grab(a.get("content_url"), a.get("file_name") or f"attachment_{a.get('id', '')}", "issue",
                  a.get("content_type", ""), a.get("size"))
+
+        # The REST payload lists every attachment of the ticket: when it reported none, skip the DOM scan.
+        if (api_complete and not records) or not dom_scan:
+            return records
 
         # 2) Fallback / supplement: attachment links visible in the DOM
         pattern = self.config.get("attachment_href_regex")
@@ -357,9 +379,13 @@ class TicketBrowserAgent:
 
     def _api_ticket_bundle(self, ticket_id: str):
         """Ticket JSON + comments. Agent API first (no extra 'who am I' call); end-user API as fallback."""
+        self._users = {}
         api_ticket = self._api_json(self._url("api_ticket_url", ticket_id=ticket_id), quiet=True)
         if api_ticket is not None:
             self.user_role = self.user_role or "agent"
+            for u in api_ticket.get("users") or []:
+                if isinstance(u, dict) and u.get("id") is not None:
+                    self._users[u["id"]] = u.get("name") or u.get("email") or ""
         elif self.config.get("api_ticket_url_enduser"):
             api_ticket = self._api_json(self._url("api_ticket_url_enduser", ticket_id=ticket_id), quiet=True)
             if api_ticket is not None:
@@ -369,9 +395,100 @@ class TicketBrowserAgent:
             self._extra_attachments = [
                 {"content_url": a.get("content"), "file_name": a.get("filename"), "content_type": a.get("mimeType", ""),
                  "size": a.get("size"), "id": a.get("id", "")} for a in api_ticket.get("attachments", [])]
+        if api_ticket is not None and self.config.get("api_style") == "jira":
+            # Jira's issue JSON already contains the comments: no second round trip.
+            cm = (((api_ticket.get("raw") or {}).get("fields") or {}).get("comment") or {}).get("comments") or []
+            cm = [{**c, "plain_body": c.get("body") if isinstance(c.get("body"), str) else ""} for c in cm]   # REST v2: plain text
+            return api_ticket, cm
         c_setting = "api_comments_url_enduser" if self.user_role == "end-user" else "api_comments_url"
         comments = self._api_paginated(self._url(c_setting, ticket_id=ticket_id), "comments")
         return api_ticket, comments
+
+    # ------------------------------------------------------------ API-first evidence (no ticket UI boot)
+    def _fast_eligible(self) -> bool:
+        return (not self.generic and bool(self.config.get("api_ticket_url")) and bool(self.platform_url)
+                and self.config.get("fast_api_evidence", True) and os.environ.get("CB_TICKET_LIVE", "0") != "1")
+
+    def _people_and_rows(self, api_ticket: dict, comments: list):
+        """(requester, assignee, updated_at, solved_at, comment rows) for Zendesk and Jira payloads."""
+        if self.config.get("api_style") == "jira":
+            f = (api_ticket.get("raw") or {}).get("fields") or {}
+            nm = lambda x: (x or {}).get("displayName") or (x or {}).get("name") or ""
+            rows = [{"author": nm(c.get("author")), "at": normalize_iso(c.get("created")), "public": "",
+                     "body": c.get("plain_body") or "", "atts": []} for c in comments or []]
+            return nm(f.get("reporter")), nm(f.get("assignee")), normalize_iso(f.get("updated")), \
+                normalize_iso(f.get("resolutiondate")), rows
+        t = api_ticket.get("ticket") or api_ticket.get("request") or {}
+        un = lambda uid: self._users.get(uid) or (f"user {uid}" if uid else "")
+        rows = [{"author": un(c.get("author_id")), "at": normalize_iso(c.get("created_at")),
+                 "public": "public" if c.get("public", True) else "internal note",
+                 "body": c.get("plain_body") or c.get("body") or "",
+                 "atts": [{"name": a.get("file_name") or "", "url": a.get("content_url") or ""}
+                          for a in c.get("attachments") or []]} for c in comments or []]
+        metric = api_ticket.get("metric_set") or (api_ticket.get("metric_sets") or [{}])[0] or {}
+        return un(t.get("requester_id")), un(t.get("assignee_id")), normalize_iso(t.get("updated_at")), \
+            normalize_iso(metric.get("solved_at")), rows
+
+    def _render_summary(self, d: dict, merged: dict, extra: dict, rows: list) -> str:
+        e = _html.escape
+        fields = [("Status", merged.get("status")), ("Priority", merged.get("priority")),
+                  ("Requester", extra.get("requester")), ("Assignee", extra.get("assignee")),
+                  ("Created", merged.get("created_date")), ("Updated", extra.get("updated_at")),
+                  ("Solved / resolved", merged.get("resolved_date"))]
+        trs = "".join(f"<tr><th>{e(k)}</th><td>{e(str(v or '-'))}</td></tr>" for k, v in fields)
+        thread = ""
+        for i, r in enumerate(rows, 1):
+            atts = "".join(f"<div class='att'>attachment: {e(a['name'])}</div>" for a in r["atts"])
+            thread += (f"<div class='c'><div class='h'>#{i} &middot; {e(r['author'] or 'unknown')} &middot; {e(r['at'])}"
+                       f" {('&middot; ' + e(r['public'])) if r['public'] else ''}</div>"
+                       f"<div class='b'>{e(r['body'])}</div>{atts}</div>")
+        return f"""<!doctype html><html><head><meta charset="utf-8"><title>Ticket {e(str(d['ticket_id']))}</title>
+<style>body{{font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif;margin:18px;color:#1f2933}}
+.banner{{background:#fff8e1;border:1px solid #f0c36d;padding:8px 10px;border-radius:6px;font-size:12px;margin-bottom:12px}}
+h1{{font-size:18px;margin:0 0 8px}}table{{border-collapse:collapse;margin-bottom:12px}}th{{text-align:left;padding:2px 14px 2px 0;color:#52606d;font-weight:600}}
+td{{padding:2px 0}}.c{{border-top:1px solid #d9e2ec;padding:8px 0}}.h{{font-size:12px;color:#52606d}}.b{{white-space:pre-wrap;margin-top:3px}}.att{{font-size:12px;color:#334e68}}</style></head><body>
+<div class="banner"><b>Evidence summary generated from the {e(self.platform.title())} REST API</b> at {e(d['collected_at_utc'])} for
+{e(self.platform_url)} &mdash; not a capture of the live ticket page. Authoritative data: documents/api_ticket_{e(str(d['ticket_id']))}.json
+and api_comments_{e(str(d['ticket_id']))}.json (SHA-256 in metadata.json).</div>
+<h1>#{e(str(d['ticket_id']))} &mdash; {e(d.get('subject_actual') or '')}</h1><table>{trs}</table>
+<div><b>Conversation ({len(rows)})</b></div>{thread}</body></html>"""
+
+    def _finish_from_api(self, ticket_id, subject_query, api_ticket, comments, tm, d):
+        docs = self.evidence_dir / "documents"
+        t = api_ticket.get("ticket") or api_ticket.get("request") or {}
+        requester, assignee, updated, solved, rows = self._people_and_rows(api_ticket, comments)
+        merged = {
+            "status": t.get("status") or "", "priority": t.get("priority") or "",
+            "created_date": normalize_iso(t.get("created_at")),
+            "resolved_date": solved,
+        }
+        d["ticket_details"] = merged
+        d["field_sources"] = {k: ("api" if v else "not_found") for k, v in merged.items()}
+        d["subject_actual"] = t.get("subject") or ""
+        d["ticket_extra"] = {"requester": requester, "assignee": assignee, "updated_at": updated,
+                             "comments": len(rows)}
+        d["login_role"] = self.user_role
+        d["evidence_mode"] = "api_summary"
+        d["pages"]["ticket_details"] = self._url("direct_ticket_url", ticket_id=ticket_id) or self.platform_url
+        if subject_query:
+            d["subject_verification"] = match_product(subject_query, [d["subject_actual"]] if d["subject_actual"] else [""])
+        with tm.phase("render_summary"):
+            summary = self._render_summary(d, merged, d["ticket_extra"], rows)
+            (docs / "ticket_summary.html").write_text(summary, encoding="utf-8")
+            d["raw_text"] = "\n".join([d["subject_actual"]] + [f"{k}: {v}" for k, v in merged.items()] +
+                                       [f"{r['author']} {r['at']}: {r['body']}" for r in rows])
+        with tm.phase("screenshot"):
+            self._ensure_page()
+            self.page.set_content(summary, wait_until="domcontentloaded")
+            self.page.screenshot(path=str(self.evidence_dir / "screenshots" / "ticket_page.jpg"),
+                                 type="jpeg", quality=65, full_page=False)
+        d["page_ready"] = True
+        d["screenshot_taken_after_ready"] = True
+        with tm.phase("attachments"):
+            d["attachments"] = self._download_attachments(comments, api_complete=True, dom_scan=False)
+        d.setdefault("timings_ms", {}).update(tm.marks)
+        d["timings_ms"]["collect_total"] = tm.total_ms()
+        return d
 
     def collect_ticket_evidence(self, case_id: str, ticket_id: str, subject_query: str) -> dict:
         ticket_id = str(ticket_id).strip().lstrip("#")
@@ -399,6 +516,15 @@ class TicketBrowserAgent:
                     write_json(docs / f"api_comments_{ticket_id}.json", {"comments": cm})
             return at, cm
 
+        # FAST PATH: the saved browser session already authenticates the REST API, so don't boot the ticket UI at all.
+        # Not signed in / API refused -> falls through to the normal flow below, which signs in.
+        if self._fast_eligible():
+            api_ticket, comments = load_api()
+            if api_ticket is not None and comments is not None:
+                return self._finish_from_api(ticket_id, subject_query, api_ticket, comments, tm, d)
+            log.info(f"[{ticket_id}] API not available with the saved session; using the live ticket page.")
+
+        d["evidence_mode"] = "live_page"
         # Warm tab: fetch the data FIRST, so the new ticket can be recognised on screen by its own text.
         # Cold tab: open the page first; it renders while the data requests run.
         api_ticket, comments, anchor = None, None, ""
@@ -417,7 +543,9 @@ class TicketBrowserAgent:
         # (text from this ticket, a timestamp or its id) and the text has stopped changing.
         with tm.phase("page_ready"):
             cold_kw = dict(any_of_selectors=["time[datetime]"],
-                           any_of_texts=[x for x in (anchor, ticket_id) if x], timeout_ms=3_500)
+                           any_of_texts=[x for x in (anchor, ticket_id) if x],
+                           # the data is already saved from the API: don't hold the case 3.5 s for a slow UI
+                           timeout_ms=800 if api_ticket else 3_500)
             nav = getattr(self, "_nav", None)
             if self._soft_used:
                 # strict: the previous ticket's DOM is still on screen, so only this ticket's own text counts
@@ -462,8 +590,14 @@ class TicketBrowserAgent:
             d["screenshot_taken_after_ready"] = bool(d["page_ready"])
         with tm.phase("dom_dump"):
             (docs / "dom_ticket_details.html").write_text(self.page.content(), encoding="utf-8")
-            for n, fr in enumerate(self.page.frames[1:7], start=1):  # iframes (composer, apps, etc.)
+            n = 0
+            for fr in self.page.frames[1:]:        # iframes (composer, apps, etc.): same-origin only, max 3
+                if n >= 3:
+                    break
+                if not (fr.url or "").startswith(self.platform_url):
+                    continue
                 try:
+                    n += 1
                     (docs / f"dom_frame_{n}.html").write_text(fr.content(), encoding="utf-8")
                 except Exception:
                     pass
@@ -504,7 +638,7 @@ class TicketBrowserAgent:
             d["subject_verification"] = match_product(subject_query, candidates)
 
         with tm.phase("attachments"):
-            d["attachments"] = self._download_attachments(comments)
+            d["attachments"] = self._download_attachments(comments, api_complete=bool(api_ticket))
 
         # Load diagnostics: where the page's load time went (hosts, slowest requests, browser navigation timing)
         try:
